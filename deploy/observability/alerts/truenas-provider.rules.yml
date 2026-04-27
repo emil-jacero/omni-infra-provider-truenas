@@ -101,6 +101,58 @@ groups:
           summary: "Over 50% of VM shutdowns are forced"
           description: "Most VMs are not shutting down gracefully. Consider increasing GRACEFUL_SHUTDOWN_TIMEOUT or checking qemu-guest-agent."
 
+      # Host RAM is full and the provider's OOM circuit breaker is
+      # exercising itself. This is the exact incident that the v0.16.1
+      # host_oom error path was added to surface — without an alert here,
+      # operators only see "uploadISO 2/4" stuck in the Omni UI for
+      # an hour before realizing the host is the problem.
+      - alert: TrueNASHostOOM
+        expr: rate(truenas_provision_errors_total{error_category="host_oom"}[10m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "TrueNAS host RAM exhausted — operator action required"
+          description: "vm.start is failing with ENOMEM. The host cannot guarantee guest memory at boot. Stop another VM, shrink the affected MachineClass, set min_memory to enable balloon, or add physical RAM. See docs/troubleshooting.md#vm-creation-succeeds-but-vm-wont-start-host-out-of-memory."
+
+      # Permanent OOM giveup — the circuit breaker has tripped after
+      # MaxStartOOMAttempts retries. Distinct from the recoverable retry
+      # alert above: this fires when a MachineRequest has gone permanent-
+      # failed and Omni surfaces the error on MachineRequestStatus.
+      - alert: TrueNASOOMPermanent
+        expr: rate(truenas_vms_oom_permanent_total[1h]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "VMs returning permanent OOM failure (circuit breaker tripped)"
+          description: "One or more MachineRequests exhausted MAX_START_OOM_ATTEMPTS retries. The provider has stopped retrying and surfaced the failure on MachineRequestStatus. Operator must free host RAM or shrink the MachineClass, then delete and recreate the request."
+
+      # MachineClass exceeds host RAM (oversized-class config error,
+      # distinct from runtime host_oom). Different operator response:
+      # fix the MachineClass YAML, not the host.
+      - alert: TrueNASMachineClassOversized
+        expr: rate(truenas_provision_errors_total{error_category="memory"}[10m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MachineClass requests more RAM than the host has"
+          description: "A MachineClass `memory` value exceeds 80% of host total RAM. Edit the MachineClass to a value that fits, or add physical RAM. See docs/sizing.md."
+
+      # Pre-flight memory check is silently degrading — the running-guest
+      # aggregate query (vm.query) is failing, so the free-RAM safety net
+      # is OFF for affected provisions. Sustained degradation is the
+      # leading indicator for the original ENOMEM-loop bug to reappear.
+      - alert: TrueNASPreflightDegraded
+        expr: rate(truenas_preflight_degraded_total[10m]) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pre-flight memory safety net silently disabled"
+          description: "vm.query is failing during pre-flight, so RunningGuestsMemoryMiB cannot be computed. The provision is admitted on the single-VM ceiling alone — runtime ENOMEM at vm.start is now possible. Check WebSocket health and TrueNAS middleware logs."
+
       # Circuit breaker auto-replacing VMs (persistent ERROR state)
       - alert: TrueNASVMAutoReplaced
         expr: rate(truenas_vms_auto_replaced_total[1h]) > 0

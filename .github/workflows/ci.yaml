@@ -74,6 +74,20 @@ jobs:
         with:
           version: v2.11.4
 
+      # shellcheck on every script under scripts/ — cheap to run, catches
+      # the class of regressions that don't surface until an operator
+      # actually runs the script on a stale shell. v0.16.x added
+      # annotate-machineclass-autoscale.sh which mutates Omni state via
+      # `omnictl apply`; a quoting/expansion regression there would land
+      # silently in users' hands without this gate.
+      - name: shellcheck
+        run: |
+          if find scripts -name '*.sh' -print -quit | grep -q .; then
+            shellcheck -S warning scripts/*.sh
+          else
+            echo "no shell scripts to check"
+          fi
+
   vulncheck:
     runs-on: ubuntu-latest
     steps:

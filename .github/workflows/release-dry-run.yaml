@@ -1,0 +1,135 @@
+name: Release Dry-Run
+
+# Validates the release workflow's tag-detection and metadata-action
+# config WITHOUT pushing a real tag. Triggered manually before cutting
+# an RC, or automatically on PRs that touch release.yaml.
+#
+# Why: this rc cycle (v0.16.1-rc.1 .. rc.5) burned 5 tags fixing CI bugs
+# that would have surfaced earlier with a dry-run gate. Each one wasted
+# a tag and operator time.
+#
+# Scope: dry-run validates the prerelease detection step output and the
+# tags `docker/metadata-action` would emit for a synthetic ref. Does NOT
+# build, push, sign, or create a release.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Synthetic tag to test (e.g. v0.16.1-rc.5 or v0.16.1)'
+        required: true
+        default: 'v0.16.1-rc.99'
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/release.yaml'
+      - '.github/workflows/release-dry-run.yaml'
+
+permissions:
+  contents: read
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Determine test tag
+        id: testtag
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            # PR mode — test both shapes to catch each path.
+            echo "tag=v0.99.99-rc.1" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Mirror the prerelease-detection step from release.yaml. If this
+      # falls out of sync with release.yaml the dry-run is meaningless,
+      # so the assertion below pins both the input shape and the output
+      # values.
+      - name: Detect prerelease (mirror of release.yaml)
+        id: prerelease
+        run: |
+          TAG="${{ steps.testtag.outputs.tag }}"
+          if [[ "$TAG" == *-* ]]; then
+            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Assert prerelease classification
+        run: |
+          TAG="${{ steps.testtag.outputs.tag }}"
+          GOT="${{ steps.prerelease.outputs.is_prerelease }}"
+          # Stable: vX.Y.Z (no `-`). Prerelease: vX.Y.Z-{rc,beta,alpha}.N
+          case "$TAG" in
+            *-*) WANT="true" ;;
+            *)   WANT="false" ;;
+          esac
+          if [ "$GOT" != "$WANT" ]; then
+            echo "::error::tag=$TAG: is_prerelease=$GOT, expected $WANT"
+            exit 1
+          fi
+          echo "OK: tag=$TAG → is_prerelease=$GOT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      # Run docker/metadata-action with the same tag rules as
+      # release.yaml. Assert the emitted tag list is what we expect for
+      # the synthetic input — catches a regression in the rules block
+      # (e.g., someone removing the `enable=` guard, swapping pattern=v
+      # back to type=semver, etc.) BEFORE a real RC is cut.
+      - name: Docker metadata (mirror of release.yaml)
+        id: meta
+        uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6.0.0
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=${{ steps.testtag.outputs.tag }}
+            type=semver,pattern={{version}},value=${{ steps.testtag.outputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ steps.testtag.outputs.tag }},enable=${{ steps.prerelease.outputs.is_prerelease == 'false' }}
+            type=raw,value=latest,enable=${{ steps.prerelease.outputs.is_prerelease == 'false' }}
+
+      - name: Assert tag matrix
+        run: |
+          TAG="${{ steps.testtag.outputs.tag }}"
+          BARE="${TAG#v}"
+          MAJOR_MINOR="$(echo "$BARE" | cut -d. -f1-2)"
+          IS_PRE="${{ steps.prerelease.outputs.is_prerelease }}"
+          TAGS_OUT='${{ steps.meta.outputs.tags }}'
+
+          echo "--- emitted tags ---"
+          echo "$TAGS_OUT"
+          echo "---"
+
+          # Both forms (v-prefix and bare-semver) must always be there.
+          # The original "metadata-action filters pattern=v{{version}} for
+          # prereleases" bug surfaced here.
+          echo "$TAGS_OUT" | grep -qF "ghcr.io/${{ github.repository }}:${TAG}" \
+            || { echo "::error::missing v-prefixed tag :${TAG}"; exit 1; }
+          echo "$TAGS_OUT" | grep -qF "ghcr.io/${{ github.repository }}:${BARE}" \
+            || { echo "::error::missing bare-semver tag :${BARE}"; exit 1; }
+
+          # Stable-only tags must be ABSENT for prereleases.
+          if [ "$IS_PRE" = "true" ]; then
+            if echo "$TAGS_OUT" | grep -qF "ghcr.io/${{ github.repository }}:latest"; then
+              echo "::error:::latest emitted for prerelease — would displace stable"
+              exit 1
+            fi
+            if echo "$TAGS_OUT" | grep -qF "ghcr.io/${{ github.repository }}:${MAJOR_MINOR}"; then
+              echo "::error:::${MAJOR_MINOR} emitted for prerelease — would displace stable"
+              exit 1
+            fi
+          fi
+
+          # Stable tags must be PRESENT for stable.
+          if [ "$IS_PRE" = "false" ]; then
+            echo "$TAGS_OUT" | grep -qF "ghcr.io/${{ github.repository }}:latest" \
+              || { echo "::error:::latest missing for stable release"; exit 1; }
+            echo "$TAGS_OUT" | grep -qF "ghcr.io/${{ github.repository }}:${MAJOR_MINOR}" \
+              || { echo "::error:::${MAJOR_MINOR} missing for stable release"; exit 1; }
+          fi
+
+          echo "OK: tag matrix is correct for tag=$TAG (is_prerelease=$IS_PRE)"

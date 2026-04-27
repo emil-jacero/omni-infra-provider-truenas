@@ -252,6 +252,7 @@ PV_NAME=$(kubectl get pvc longhorn-test-pvc -o jsonpath='{.spec.volumeName}' 2>/
 kubectl delete pvc longhorn-test-pvc 2>/dev/null || true
 
 if [[ -n "$PV_NAME" ]]; then
+    # shellcheck disable=SC2034 # i is the seq index, body checks PV_EXISTS not i
     for i in $(seq 1 60); do
         PV_EXISTS=$(kubectl get pv "$PV_NAME" --no-headers 2>/dev/null | wc -l | tr -d ' ')
         if [[ "$PV_EXISTS" == "0" ]]; then break; fi

@@ -179,14 +179,51 @@ omnictl apply -f "$PATCHED" || fail "omnictl apply failed"
 
 info "verifying annotations on Omni"
 VERIFY="$(omnictl get machineclasses "$CLASS_NAME" -o yaml)"
+
+# Structural verification: walk the parsed YAML's metadata.annotations
+# map and check each expected key/value rather than substring-matching
+# against the raw text. The previous `grep -Fq "$k: $v"` approach had
+# two false-positive paths: (1) a coincidental key/value pair elsewhere
+# in the YAML (other resources, conditions, labels) could satisfy the
+# grep without the requested annotation actually being on the
+# MachineClass; (2) numeric values like `min: 2` could match an
+# unrelated field. This block uses the same parser as the patcher
+# (yq if present, python3 yaml.safe_load fallback) so the check is
+# structural and unambiguous.
 missing=0
-for i in "${!KEYS[@]}"; do
-  k="${KEYS[$i]}" v="${VALS[$i]}"
-  if ! grep -Fq "$k: \"$v\"" <<<"$VERIFY" && ! grep -Fq "$k: $v" <<<"$VERIFY"; then
-    echo "  [MISS] $k=$v"
+if [[ "$PATCHER" == "yq" ]]; then
+  for i in "${!KEYS[@]}"; do
+    k="${KEYS[$i]}" v="${VALS[$i]}"
+    actual=$(k="$k" yq '.metadata.annotations[strenv(k)]' <<<"$VERIFY" 2>/dev/null)
+    # yq emits "null" (no quotes) when the key is absent.
+    if [[ "$actual" == "null" || "$actual" != "$v" ]]; then
+      echo "  [MISS] $k expected=\"$v\" actual=\"$actual\""
+      missing=1
+    fi
+  done
+else
+  # python3 fallback. Pass YAML content via env var (sidestep heredoc-vs-
+  # stdin conflict) and KEYS/VALS via argv to avoid shell quoting on
+  # user-supplied values.
+  if ! VERIFY="$VERIFY" python3 - "${KEYS[@]}" "--sep--" "${VALS[@]}" <<'PY'
+import os, sys, yaml
+rest = sys.argv[1:]
+sep = rest.index("--sep--")
+keys, vals = rest[:sep], rest[sep+1:]
+doc = yaml.safe_load(os.environ["VERIFY"]) or {}
+ann = (doc.get("metadata") or {}).get("annotations") or {}
+miss = []
+for k, v in zip(keys, vals):
+    if str(ann.get(k, "")) != v:
+        miss.append((k, v, ann.get(k)))
+for k, v, a in miss:
+    print(f"  [MISS] {k} expected=\"{v}\" actual=\"{a}\"")
+sys.exit(1 if miss else 0)
+PY
+  then
     missing=1
   fi
-done
+fi
 (( missing == 0 )) || fail "one or more annotations did not round-trip; inspect with: omnictl get machineclasses $CLASS_NAME -o yaml"
 
 pass "MachineClass '$CLASS_NAME' opted into autoscaling (min=$MIN, max=$MAX)"

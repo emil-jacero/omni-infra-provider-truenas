@@ -162,6 +162,7 @@ EOF
 
 # Wait for bind
 BOUND=false
+# shellcheck disable=SC2034 # i is the seq index, body checks STATUS not i
 for i in $(seq 1 60); do
     STATUS=$(kubectl get pvc longhorn-test-pvc -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
     if [[ "$STATUS" == "Bound" ]]; then
