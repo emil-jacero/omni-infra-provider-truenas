@@ -30,6 +30,62 @@ func TestCreateVM_Success(t *testing.T) {
 	assert.Equal(t, testVMName, vm.Name)
 }
 
+// TestCreateVM_MinMemory_OmitemptyZero pins the wire-format contract for
+// the hard-reservation case. TrueNAS rejects a literal `0` for min_memory;
+// the field MUST be absent (not present-as-zero). Without this test, a
+// struct-tag typo (`min-memory`, `minMemory`) compiles, the existing
+// CreateVM_Success test still passes, and every provisioning request
+// silently loses the balloon-config knob.
+func TestCreateVM_MinMemory_OmitemptyZero(t *testing.T) {
+	c := newMockClient(t, func(method string, params json.RawMessage) (any, *jsonRPCError) {
+		assert.Equal(t, "vm.create", method)
+
+		// Decode the actual JSON-RPC params and assert min_memory is
+		// absent from the keys. Using json.RawMessage round-trip so
+		// we're testing what's on the wire, not what's in the Go struct.
+		var got map[string]any
+		require.NoError(t, json.Unmarshal(params, &got))
+		_, present := got["min_memory"]
+		assert.False(t, present, "min_memory must be omitted (not present-as-zero) when MinMemory=0")
+
+		return VM{ID: 42}, nil
+	})
+
+	_, err := c.CreateVM(context.Background(), CreateVMRequest{
+		Name:       testVMName,
+		VCPUs:      2,
+		Memory:     4096,
+		MinMemory:  0,
+		Bootloader: "UEFI",
+	})
+	require.NoError(t, err)
+}
+
+// TestCreateVM_MinMemory_SerializesWhenSet pins the balloon-config wire
+// format. When MinMemory is non-zero, it must serialize as an integer
+// under the `min_memory` JSON key (not `minMemory`, `min-memory`, etc.).
+func TestCreateVM_MinMemory_SerializesWhenSet(t *testing.T) {
+	c := newMockClient(t, func(_ string, params json.RawMessage) (any, *jsonRPCError) {
+		var got map[string]any
+		require.NoError(t, json.Unmarshal(params, &got))
+
+		raw, present := got["min_memory"]
+		assert.True(t, present, "min_memory key must be present when MinMemory>0")
+		assert.EqualValues(t, 2048, raw, "min_memory must be the integer 2048 (not stringified)")
+
+		return VM{ID: 42}, nil
+	})
+
+	_, err := c.CreateVM(context.Background(), CreateVMRequest{
+		Name:       testVMName,
+		VCPUs:      2,
+		Memory:     4096,
+		MinMemory:  2048,
+		Bootloader: "UEFI",
+	})
+	require.NoError(t, err)
+}
+
 func TestGetVM_Success(t *testing.T) {
 	c := newMockClient(t, func(method string, _ json.RawMessage) (any, *jsonRPCError) {
 		assert.Equal(t, methodVMQuery, method)
@@ -82,6 +138,44 @@ func TestRunningGuestsMemoryMiB_EmptyHost(t *testing.T) {
 	total, err := c.RunningGuestsMemoryMiB(context.Background())
 	require.NoError(t, err)
 	assert.Equal(t, int64(0), total)
+}
+
+// TestRunningGuestsMemoryMiB_QueryError pins the contract that pre-flight
+// callers rely on: a vm.query failure propagates the error so the caller
+// can degrade explicitly (single-VM ceiling fallback). Without this test,
+// a future "swallow error and return 0" refactor would silently disable
+// the free-RAM safety net and the pre-flight would happily admit VMs into
+// a full host.
+func TestRunningGuestsMemoryMiB_QueryError(t *testing.T) {
+	c := newMockClient(t, func(_ string, _ json.RawMessage) (any, *jsonRPCError) {
+		return nil, &jsonRPCError{Code: 99, Message: "transport hiccup"}
+	})
+
+	total, err := c.RunningGuestsMemoryMiB(context.Background())
+	require.Error(t, err)
+	assert.Equal(t, int64(0), total)
+}
+
+// TestRunningGuestsMemoryMiB_TransitionalStates pins behavior for
+// non-RUNNING states. STARTING / SUSPENDED / ERROR / "" must NOT count
+// toward the host-RAM commitment because TrueNAS only locks guest pages
+// once the guest is fully RUNNING. Counting them would cause spurious
+// free-RAM rejections during transitional storms (e.g., autoscaler
+// bursting many VMs simultaneously, all in STARTING for ~30s).
+func TestRunningGuestsMemoryMiB_TransitionalStates(t *testing.T) {
+	c := newMockClient(t, func(_ string, _ json.RawMessage) (any, *jsonRPCError) {
+		return []VM{
+			{ID: 1, Memory: 4096, Status: VMStatus{State: "RUNNING"}},
+			{ID: 2, Memory: 8192, Status: VMStatus{State: "STARTING"}},
+			{ID: 3, Memory: 2048, Status: VMStatus{State: "SUSPENDED"}},
+			{ID: 4, Memory: 1024, Status: VMStatus{State: "ERROR"}},
+			{ID: 5, Memory: 512, Status: VMStatus{State: ""}},
+		}, nil
+	})
+
+	total, err := c.RunningGuestsMemoryMiB(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, int64(4096), total, "only RUNNING (4096) counts; STARTING/SUSPENDED/ERROR/empty must be excluded")
 }
 
 // TestIsNoMemory pins both detection paths: TrueNAS error code 12 (the

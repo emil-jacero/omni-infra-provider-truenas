@@ -6,12 +6,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/siderolabs/omni/client/pkg/omni/resources/infra"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
 	"github.com/bearbinary/omni-infra-provider-truenas/api/specs"
 	"github.com/bearbinary/omni-infra-provider-truenas/internal/client"
+	"github.com/bearbinary/omni-infra-provider-truenas/internal/resources"
 )
 
 // --- verifyVMExists tests ---
@@ -153,6 +155,70 @@ func TestHealthCheck_AlreadyFinalized_VMGone(t *testing.T) {
 }
 
 // --- Deprovision: VM already gone ---
+
+// TestDeprovision_ClearsCircuitBreakers pins the fix for the leak flagged
+// by all five reviewers: oomCounts and errorCounts must drop the entries
+// for a deprovisioned MachineRequest. Without this, a recreate of the
+// same request name inherits stale counters and may immediately
+// permanent-fail with no retry budget.
+func TestDeprovision_ClearsCircuitBreakers(t *testing.T) {
+	t.Parallel()
+
+	const testRequestID = "test-machine"
+
+	p := NewProvisioner(client.NewMockClient(func(method string, _ json.RawMessage) (any, error) {
+		switch method {
+		case "vm.stop":
+			return true, nil
+		case "vm.query":
+			return managedVM(42, "STOPPED"), nil
+		case "vm.delete":
+			return true, nil
+		case "pool.dataset.query":
+			return map[string]any{
+				"id": "tank/omni-vms/" + testRequestID,
+				"user_properties": map[string]any{
+					"org.omni:managed":    map[string]any{"value": "true"},
+					"org.omni:request-id": map[string]any{"value": testRequestID},
+				},
+			}, nil
+		case "pool.dataset.delete":
+			return nil, nil
+		}
+		return nil, nil
+	}), ProviderConfig{
+		DefaultPool:             "tank",
+		GracefulShutdownTimeout: 10 * time.Millisecond,
+		PollInterval:            5 * time.Millisecond,
+	})
+
+	// Pre-populate both circuit-breaker maps as if a prior provisioning
+	// had hit ENOMEM and ERROR-state recoveries. BuildVMName sanitizes
+	// hyphens to underscores, so "test-machine" → "omni_truenas_test_machine".
+	vmName := "omni_truenas_test_machine"
+	p.recordOOMAttempt(vmName)
+	p.recordOOMAttempt(vmName)
+	p.recordVMError(42)
+
+	require.Equal(t, 2, p.oomCounts[vmName])
+	require.Equal(t, 1, p.errorCounts[42])
+
+	machine := resources.NewMachine("default", testRequestID)
+	machine.TypedSpec().Value = &specs.MachineSpec{
+		VmId:     42,
+		ZvolPath: "tank/omni-vms/" + testRequestID,
+	}
+
+	req := infra.NewMachineRequest(testRequestID)
+
+	err := p.Deprovision(context.Background(), zap.NewNop(), machine, req)
+	require.NoError(t, err)
+
+	// After Deprovision, both maps must be empty for this request.
+	assert.Equal(t, 0, p.oomCounts[vmName], "oomCounts[vmName] must be cleared")
+	assert.Equal(t, 0, p.errorCounts[42], "errorCounts[vmID] must be cleared")
+	assert.False(t, p.ActiveVMNames()[vmName], "vmName must be untracked")
+}
 
 func TestDeprovision_VMAlreadyGone_Succeeds(t *testing.T) {
 	t.Parallel()

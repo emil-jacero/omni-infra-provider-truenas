@@ -104,14 +104,29 @@ func (c *Client) ListVMs(ctx context.Context) ([]VM, error) {
 //
 // Provider-managed and externally-managed VMs are both included — the host
 // memory ceiling doesn't care who created the guest.
+//
+// Sends a server-side filter+select to `vm.query` so TrueNAS returns only
+// RUNNING rows with only the `memory` and `status` fields populated.
+// Without the filter, a host with 50+ VMs would round-trip ~50 full row
+// objects (id, name, description, vcpus, bootloader, autostart, …) per
+// pre-flight — wasted bandwidth + decode allocation under provisioning
+// storms. The provider-side filter covers correctness if the server
+// silently ignores the select hint.
 func (c *Client) RunningGuestsMemoryMiB(ctx context.Context) (int64, error) {
-	vms, err := c.ListVMs(ctx)
-	if err != nil {
-		return 0, err
+	filter := []any{
+		[]any{[]any{"status.state", "=", "RUNNING"}},
+		map[string]any{"select": []string{"memory", "status"}},
+	}
+
+	var vms []VM
+	if err := c.call(ctx, methodVMQuery, filter, &vms); err != nil {
+		return 0, fmt.Errorf("vm.query (running guests) failed: %w", err)
 	}
 
 	var total int64
 	for _, vm := range vms {
+		// Defensive: if TrueNAS ignores `status.state` filter, re-check
+		// here. Older TrueNAS releases vary in select-key support.
 		if vm.Status.State == "RUNNING" {
 			total += int64(vm.Memory)
 		}

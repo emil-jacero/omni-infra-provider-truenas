@@ -3,16 +3,27 @@ package provisioner
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 	"go.uber.org/zap"
 
 	"github.com/bearbinary/omni-infra-provider-truenas/api/specs"
 	"github.com/bearbinary/omni-infra-provider-truenas/internal/client"
 )
+
+// noopSpan returns a span that records no telemetry — for testing
+// preflight functions that need a span argument but where the actual
+// trace data is not under test.
+func noopSpan() trace.Span {
+	_, span := noop.NewTracerProvider().Tracer("test").Start(context.Background(), "test")
+	return span
+}
 
 func testProvisioner(handler client.MockHandler) *Provisioner {
 	return NewProvisioner(client.NewMockClient(handler), ProviderConfig{
@@ -636,4 +647,183 @@ func TestClearOOMAttempts_ResetsCounter(t *testing.T) {
 	p.clearOOMAttempts("omni_test")
 
 	assert.Equal(t, 1, p.recordOOMAttempt("omni_test"), "counter must restart from 1 after clear")
+}
+
+// TestTranslateStartError_PermanentWrapsErrHostOOM pins the contract that
+// the permanent-failure error wraps ErrHostOOM. categorizeError uses
+// errors.Is to route to host_oom; if a future refactor unwraps or
+// shadows the sentinel, the metric bucket silently breaks.
+func TestTranslateStartError_PermanentWrapsErrHostOOM(t *testing.T) {
+	p := NewProvisioner(client.NewMockClient(func(_ string, _ json.RawMessage) (any, error) {
+		return nil, nil
+	}), ProviderConfig{MaxStartOOMAttempts: 1})
+
+	enomem := &client.APIError{Code: client.ErrCodeNoMemory, Message: "[ENOMEM]"}
+
+	// Attempt 1 — retriable; still wraps ErrHostOOM.
+	err := p.translateStartError(zap.NewNop(), 42, "omni_test", 4096, enomem)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, ErrHostOOM), "retriable ENOMEM error must wrap ErrHostOOM")
+
+	// Attempt 2 — exceeds budget; permanent. MUST also wrap ErrHostOOM.
+	err = p.translateStartError(zap.NewNop(), 42, "omni_test", 4096, enomem)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, ErrHostOOM), "permanent ENOMEM error must wrap ErrHostOOM")
+	assert.Equal(t, "host_oom", categorizeError(err), "permanent ENOMEM must categorize as host_oom")
+}
+
+// TestResetNVRAMIfNeeded_ENOMEM_IncrementsCounter pins the fix for the
+// NVRAM-reset bypass bug. Pre-fix, the post-NVRAM-reset start path
+// silently swallowed ENOMEM — the OOM circuit breaker never fired and
+// a host-OOM during firmware recovery would loop forever with no
+// MachineRequestStatus signal.
+func TestResetNVRAMIfNeeded_ENOMEM_IncrementsCounter(t *testing.T) {
+	startCalls := 0
+	p := testProvisioner(func(method string, _ json.RawMessage) (any, error) {
+		switch method {
+		case "vm.query":
+			return managedVM(42, "ERROR"), nil
+		case "vm.update":
+			return nil, nil // NVRAM reset succeeds
+		case "vm.start":
+			startCalls++
+			return nil, &client.APIError{Code: client.ErrCodeNoMemory, Message: "[ENOMEM]"}
+		}
+		return nil, nil
+	})
+
+	p.resetNVRAMIfNeeded(context.Background(), zap.NewNop(), 42, "omni_test")
+
+	assert.Equal(t, 1, startCalls, "vm.start should have been attempted")
+	assert.Equal(t, 1, p.oomCounts["omni_test"], "ENOMEM after NVRAM reset must increment the OOM circuit breaker")
+}
+
+// TestPreflightHostMemory pins the v0.16.1 host-OOM fix end-to-end. This
+// is the function whose absence in v0.16.0 caused the talos-home-workers
+// infinite-ENOMEM loop. Tests cover all six contract paths:
+// (a) plenty-of-RAM happy path; (b) free-RAM rejection with balloon
+// hint; (c) free-RAM rejection without balloon hint when MinMemory set;
+// (d) balloon config that fits MinMemory but not memory — admitted;
+// (e) single-VM ceiling rejection (oversized class); (f) graceful
+// degradation when SystemMemoryAvailable fails; (g) graceful
+// degradation when RunningGuestsMemoryMiB fails.
+//
+//nolint:tparallel,paralleltest // Subtests share an unexported pre-populated maps via the table; running parallel would race.
+func TestPreflightHostMemory(t *testing.T) {
+	mibToBytes := func(mib int64) int64 { return mib * 1024 * 1024 }
+
+	tests := []struct {
+		name            string
+		hostMib         int64
+		runningMib      int64
+		runningQueryOK  bool
+		systemInfoOK    bool
+		dataMemory      int
+		dataMinMemory   int
+		wantErrSubstr   string
+		wantErrIsOOM    bool
+		wantBalloonHint bool
+	}{
+		{
+			name:           "plenty of RAM, no balloon",
+			hostMib:        16384,
+			runningMib:     0,
+			runningQueryOK: true, systemInfoOK: true,
+			dataMemory: 4096, dataMinMemory: 0,
+			wantErrSubstr: "",
+		},
+		{
+			name:           "free-RAM ceiling: tight host, no balloon → reject + balloon hint",
+			hostMib:        8192,
+			runningMib:     6144,
+			runningQueryOK: true, systemInfoOK: true,
+			dataMemory: 4096, dataMinMemory: 0,
+			wantErrSubstr: "TrueNAS host has", wantErrIsOOM: true, wantBalloonHint: true,
+		},
+		{
+			name:           "free-RAM ceiling: balloon config min=1500 fits free → admit",
+			hostMib:        8192,
+			runningMib:     6144,
+			runningQueryOK: true, systemInfoOK: true,
+			dataMemory: 4096, dataMinMemory: 1500,
+			wantErrSubstr: "",
+		},
+		{
+			name:           "free-RAM ceiling: balloon config min=2500 too big → reject, NO balloon hint",
+			hostMib:        8192,
+			runningMib:     6144,
+			runningQueryOK: true, systemInfoOK: true,
+			dataMemory: 4096, dataMinMemory: 2500,
+			wantErrSubstr: "TrueNAS host has", wantErrIsOOM: true, wantBalloonHint: false,
+		},
+		{
+			name:           "single-VM ceiling: oversized class → reject, NOT host_oom",
+			hostMib:        8192,
+			runningMib:     0,
+			runningQueryOK: true, systemInfoOK: true,
+			dataMemory: 8000, dataMinMemory: 0,
+			wantErrSubstr: "MachineClass exceeds host RAM", wantErrIsOOM: false,
+		},
+		{
+			name:           "system.info fails → preflight skipped (defer to runtime)",
+			hostMib:        0,
+			runningMib:     0,
+			runningQueryOK: true, systemInfoOK: false,
+			dataMemory: 4096, dataMinMemory: 0,
+			wantErrSubstr: "",
+		},
+		{
+			name:           "RunningGuestsMemoryMiB fails → degrade to single-VM ceiling, single-VM passes",
+			hostMib:        16384,
+			runningMib:     0,
+			runningQueryOK: false, systemInfoOK: true,
+			dataMemory: 4096, dataMinMemory: 0,
+			wantErrSubstr: "",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			p := testProvisioner(func(method string, params json.RawMessage) (any, error) {
+				switch method {
+				case "system.info":
+					if !tc.systemInfoOK {
+						return nil, &client.APIError{Code: 99, Message: "system.info hiccup"}
+					}
+					return map[string]any{"physmem": mibToBytes(tc.hostMib)}, nil
+				case "vm.query":
+					if !tc.runningQueryOK {
+						return nil, &client.APIError{Code: 99, Message: "vm.query hiccup"}
+					}
+					// Return a single fake RUNNING VM with the requested
+					// running-memory total.
+					if tc.runningMib > 0 {
+						return []client.VM{
+							{ID: 1, Memory: int(tc.runningMib), Status: client.VMStatus{State: "RUNNING"}},
+						}, nil
+					}
+					return []client.VM{}, nil
+				}
+				return nil, nil
+			})
+
+			data := Data{Memory: tc.dataMemory, MinMemory: tc.dataMinMemory}
+			err := p.preflightHostMemory(context.Background(), zap.NewNop(), noopSpan(), data)
+
+			if tc.wantErrSubstr == "" {
+				assert.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantErrSubstr)
+			assert.Equal(t, tc.wantErrIsOOM, errors.Is(err, ErrHostOOM),
+				"ErrHostOOM-wrapping mismatch — host-RAM rejection wraps; oversized-class rejection does not")
+			if tc.wantBalloonHint {
+				assert.Contains(t, err.Error(), "min_memory")
+			} else if tc.wantErrIsOOM {
+				assert.NotContains(t, err.Error(), "min_memory",
+					"balloon hint must NOT appear when MinMemory is already set (operator already knows about the knob)")
+			}
+		})
+	}
 }

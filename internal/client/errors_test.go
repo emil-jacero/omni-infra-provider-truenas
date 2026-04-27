@@ -95,6 +95,11 @@ func TestUserFriendlyError_TableDriven(t *testing.T) {
 		{"auth keyword", fmt.Errorf("auth failed"), "authentication failed"},
 		{"authentication keyword", fmt.Errorf("authentication error"), "authentication failed"},
 		{"plain error", fmt.Errorf("something random"), "something random"},
+		// host_oom — the user-friendly string is what the categorizer's
+		// substring backstop scans for AND what surfaces on
+		// MachineRequestStatus, so renaming the wording without updating
+		// both places would silently break the host_oom alert path.
+		{"no memory (ENOMEM code 12)", &APIError{Code: ErrCodeNoMemory, Message: "kvm enomem"}, "out of free RAM"},
 	}
 
 	for _, tc := range tests {
