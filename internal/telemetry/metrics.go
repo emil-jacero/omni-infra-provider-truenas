@@ -34,12 +34,34 @@ func WithPatchKind(kind string) metric.MeasurementOption {
 	return metric.WithAttributes(attribute.String("patch_kind", kind))
 }
 
+// Error category strings used as label values on truenas.provision.errors.
+// Centralizing these as constants keeps the categorizer (provisioner.categorizeError),
+// the dashboards/alerts that filter by these strings, and any test that pins
+// a category from drifting independently. Renaming a category here is now a
+// single edit; before, renaming required grep across Go code + Grafana JSON +
+// rules.yml.
+const (
+	ErrCategoryUnknown       = "unknown"
+	ErrCategoryPoolNotFound  = "pool_not_found"
+	ErrCategoryPoolFull      = "pool_full"
+	ErrCategoryConfigInvalid = "config_invalid"
+	ErrCategoryConfigPatch   = "config_patch"
+	ErrCategoryNICInvalid    = "nic_invalid"
+	ErrCategoryConnection    = "connection"
+	ErrCategoryAuth          = "auth"
+	ErrCategoryTimeout       = "timeout"
+	ErrCategoryHostOOM       = "host_oom"
+	ErrCategoryMemory        = "memory"
+	ErrCategoryImage         = "image"
+)
+
 // Pre-defined metric instruments for the provider.
 var (
 	VMsProvisioned   metric.Int64Counter
 	VMsDeprovisioned metric.Int64Counter
 	VMsErrored       metric.Int64Counter
 	VMsAutoReplaced  metric.Int64Counter
+	VMsOOMPermanent  metric.Int64Counter
 	ZvolsResized     metric.Int64Counter
 
 	// Host health gauges
@@ -72,6 +94,14 @@ var (
 
 	// Error categorization
 	ProvisionErrors metric.Int64Counter
+
+	// PreflightDegraded counts how many times the createVM pre-flight had to
+	// fall back to the single-VM ceiling because RunningGuestsMemoryMiB
+	// failed. Each increment means the free-RAM safety net is silently off
+	// for that provision. A sustained non-zero rate is the leading indicator
+	// for the original ENOMEM-loop bug to reappear (pre-flight passes by
+	// only checking total RAM, vm.start then ENOMEMs).
+	PreflightDegraded metric.Int64Counter
 
 	// ISO cache
 	ISOCacheHits   metric.Int64Counter
@@ -119,6 +149,9 @@ func initMetrics() {
 	)
 	VMsAutoReplaced, _ = meter.Int64Counter("truenas.vms.auto_replaced",
 		metric.WithDescription("Total VMs auto-deprovisioned by circuit breaker after exceeding max error recoveries"),
+	)
+	VMsOOMPermanent, _ = meter.Int64Counter("truenas.vms.oom_permanent",
+		metric.WithDescription("VMs that hit MaxStartOOMAttempts and returned a permanent error — terminal signal that host RAM exhausted the OOM retry budget"),
 	)
 	ZvolsResized, _ = meter.Int64Counter("truenas.zvols.resized",
 		metric.WithDescription("Total zvols resized"),
@@ -186,6 +219,9 @@ func initMetrics() {
 	// Error categorization
 	ProvisionErrors, _ = meter.Int64Counter("truenas.provision.errors",
 		metric.WithDescription("Provision errors by category"),
+	)
+	PreflightDegraded, _ = meter.Int64Counter("truenas.preflight.degraded",
+		metric.WithDescription("Pre-flight memory check fell back to single-VM ceiling because the running-guest aggregate query failed — free-RAM safety net is silently off"),
 	)
 
 	// ISO cache

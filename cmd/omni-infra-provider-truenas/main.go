@@ -276,6 +276,7 @@ func run() error {
 		DefaultBootMethod:       defaultBootMethod,
 		GracefulShutdownTimeout: time.Duration(envInt("GRACEFUL_SHUTDOWN_TIMEOUT", 30)) * time.Second,
 		MaxErrorRecoveries:      envInt("MAX_ERROR_RECOVERIES", 5),
+		MaxStartOOMAttempts:     envInt("MAX_START_OOM_ATTEMPTS", 5),
 	})
 
 	// Create infra provider

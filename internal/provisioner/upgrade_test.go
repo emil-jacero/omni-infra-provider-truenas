@@ -35,7 +35,7 @@ func TestResetNVRAMIfNeeded_ErrorState(t *testing.T) {
 		return nil, nil
 	})
 
-	p.resetNVRAMIfNeeded(context.Background(), testLogger(), 42)
+	p.resetNVRAMIfNeeded(context.Background(), testLogger(), 42, "omni_test")
 
 	assert.True(t, nvramReset, "should reset NVRAM for ERROR state VM")
 	assert.True(t, vmStarted, "should restart VM after NVRAM reset")
@@ -58,7 +58,7 @@ func TestResetNVRAMIfNeeded_RunningState_Noop(t *testing.T) {
 		return nil, nil
 	})
 
-	p.resetNVRAMIfNeeded(context.Background(), testLogger(), 42)
+	p.resetNVRAMIfNeeded(context.Background(), testLogger(), 42, "omni_test")
 
 	assert.False(t, nvramReset, "should not reset NVRAM for running VM")
 }

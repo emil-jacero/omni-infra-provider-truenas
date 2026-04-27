@@ -12,6 +12,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/bearbinary/omni-infra-provider-truenas/internal/resources"
+	"github.com/bearbinary/omni-infra-provider-truenas/internal/resources/meta"
 	"github.com/bearbinary/omni-infra-provider-truenas/internal/telemetry"
 )
 
@@ -67,6 +68,18 @@ func (p *Provisioner) Deprovision(ctx context.Context, logger *zap.Logger, machi
 	if telemetry.DeprovisionDuration != nil {
 		telemetry.DeprovisionDuration.Record(cleanupCtx, time.Since(start).Seconds())
 	}
+
+	// Clear both circuit-breaker counters now that the VM is gone. Without
+	// this, oomCounts[vmName] and errorCounts[vmID] accumulate forever for
+	// every failed/permanent-failed/deprovisioned MachineRequest — a slow
+	// memory leak in long-running providers AND a correctness bug if the
+	// same MachineRequest is recreated (it would inherit a stale counter
+	// and may immediately permanent-fail without retry budget).
+	if requestID != "" {
+		p.clearOOMAttempts(meta.BuildVMName(meta.ProviderID, requestID))
+	}
+	p.clearVMErrors(int(state.VmId))
+	p.UntrackVMName(meta.BuildVMName(meta.ProviderID, requestID))
 
 	logger.Info("deprovision complete",
 		zap.Int("vm_id", int(state.VmId)),

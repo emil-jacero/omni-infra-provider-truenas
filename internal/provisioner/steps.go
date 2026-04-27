@@ -22,6 +22,7 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 
 	"github.com/bearbinary/omni-infra-provider-truenas/api/specs"
 	"github.com/bearbinary/omni-infra-provider-truenas/internal/client"
@@ -32,9 +33,24 @@ import (
 
 var provTracer = otel.Tracer("truenas-provisioner")
 
+// ErrHostOOM is the sentinel error wrapped by translateStartError and the
+// pre-flight free-RAM rejection. categorizeError uses errors.Is(err, ErrHostOOM)
+// as the primary classifier so a future wording change to the user-facing
+// message does not silently break the host_oom metric bucket. The substring
+// fallback in categorizeError remains only for raw libvirt-relayed errors
+// that arrive before translation (e.g., the post-NVRAM-reset start path).
+var ErrHostOOM = errors.New("host out of memory")
+
 // isoHTTPClient is reused across ISO downloads to benefit from connection pooling
 // (TLS session resumption, keep-alive) when hitting Image Factory repeatedly.
 var isoHTTPClient = &http.Client{Timeout: 10 * time.Minute}
+
+// maxISODownloadBytes caps the body size of the ISO download. Talos nocloud
+// ISOs are ~120 MiB; 2 GiB gives 16× headroom for future image growth while
+// bounding the disk-fill DoS surface on first download (TOFU has no recorded
+// hash to compare on the first cache miss). A compromised or MITM'd Image
+// Factory streaming an unbounded body would otherwise fill the ISO zvol.
+const maxISODownloadBytes int64 = 2 * 1024 * 1024 * 1024
 
 const errUnmarshalProviderData = "failed to unmarshal provider data: %w"
 
@@ -280,14 +296,33 @@ func (p *Provisioner) stepUploadISO(ctx context.Context, logger *zap.Logger, pct
 			return nil, fmt.Errorf("ISO download returned status %d", resp.StatusCode)
 		}
 
+		// Reject impossibly-large ISOs before reading. ContentLength is
+		// advisory (factory may chunk-encode), so this is defense-in-depth
+		// alongside the LimitReader below.
+		if resp.ContentLength > 0 && resp.ContentLength > maxISODownloadBytes {
+			return nil, fmt.Errorf("ISO Content-Length %d exceeds cap %d — refusing to download", resp.ContentLength, maxISODownloadBytes)
+		}
+
+		// Cap the actual byte stream regardless of Content-Length. If the
+		// factory exceeds the cap we want the read to error rather than
+		// fill the zvol. io.LimitReader returns EOF at the cap which would
+		// look like a successful short read; wrap so callers see an error.
+		limited := &io.LimitedReader{R: resp.Body, N: maxISODownloadBytes + 1}
+
 		// Compute SHA-256 while streaming to TrueNAS so we don't buffer the
 		// entire ISO in memory. Hash is only usable after upload completes.
 		hasher := sha256.New()
-		teed := io.TeeReader(resp.Body, hasher)
+		teed := io.TeeReader(limited, hasher)
 
 		// Upload to TrueNAS
 		if err := p.client.UploadFile(ctx, isoPath, teed, resp.ContentLength); err != nil {
 			return nil, fmt.Errorf("failed to upload ISO to TrueNAS: %w", err)
+		}
+
+		// Detect cap-exceeded: if N reached 0 we read maxISODownloadBytes+1
+		// without EOF — the body was larger than the cap.
+		if limited.N == 0 {
+			return nil, fmt.Errorf("ISO download exceeded cap of %d bytes — possible factory compromise or unbounded response, refusing", maxISODownloadBytes)
 		}
 
 		downloadedHash := hex.EncodeToString(hasher.Sum(nil))
@@ -436,61 +471,8 @@ func (p *Provisioner) stepCreateVM(ctx context.Context, logger *zap.Logger, pctx
 	//     `[ENOMEM] Cannot guarantee memory for guest`. Subtracting the
 	//     RUNNING-guest commitment up-front turns that infinite-retry
 	//     pattern into an immediate, actionable provision error.
-	hostMem, memErr := p.client.SystemMemoryAvailable(ctx)
-	if memErr == nil {
-		// The host has to lock min_memory at vm.start (and only min_memory
-		// if balloon is configured). If min_memory is unset the full memory
-		// value is reserved. Comparing against the *actual reservation*
-		// avoids rejecting valid balloon configs that have memory >>
-		// host-free but min_memory < host-free.
-		reservedMiB := int64(data.Memory)
-		if data.MinMemory > 0 {
-			reservedMiB = int64(data.MinMemory)
-		}
-
-		ceilingMiB := int64(data.Memory)
-		hostMiB := hostMem / (1024 * 1024)
-
-		if ceilingMiB > hostMiB*80/100 {
-			return fmt.Errorf("host has %d MiB total memory but VM ceiling is %d MiB — "+
-				"a single VM should not exceed 80%% of host RAM (TrueNAS needs the rest for ZFS ARC). "+
-				"Reduce memory or add more host RAM", hostMiB, ceilingMiB)
-		}
-
-		// Best-effort: if the running-VM aggregate query fails, fall back to
-		// the single-VM ceiling above rather than blocking provisioning on
-		// an observability call. Logged at debug so the pre-flight degrades
-		// silently in the happy path.
-		runningMiB, runErr := p.client.RunningGuestsMemoryMiB(ctx)
-		if runErr != nil {
-			logger.Debug("memory check: skipping running-guest aggregate (non-fatal)",
-				zap.Int64("host_mib", hostMiB),
-				zap.Int64("reserved_mib", reservedMiB),
-				zap.Error(runErr),
-			)
-		} else {
-			freeMiB := hostMiB - runningMiB
-
-			logger.Debug("memory check",
-				zap.Int64("host_mib", hostMiB),
-				zap.Int64("running_mib", runningMiB),
-				zap.Int64("free_mib", freeMiB),
-				zap.Int64("ceiling_mib", ceilingMiB),
-				zap.Int64("reserved_mib", reservedMiB),
-				zap.Int64("free_threshold_mib", freeMiB*90/100),
-			)
-
-			if reservedMiB > freeMiB*90/100 {
-				balloonHint := ""
-				if data.MinMemory == 0 {
-					balloonHint = " Set min_memory to a smaller value to enable memory ballooning instead of a hard reservation."
-				}
-
-				return fmt.Errorf("TrueNAS host has %d MiB free (%d total minus %d MiB committed to RUNNING guests); "+
-					"VM needs %d MiB reserved at start. Stop another guest, shrink this MachineClass, or add host RAM.%s",
-					freeMiB, hostMiB, runningMiB, reservedMiB, balloonHint)
-			}
-		}
+	if err := p.preflightHostMemory(ctx, logger, span, data); err != nil {
+		return err
 	}
 
 	// Create zvol for the VM disk
@@ -916,9 +898,17 @@ func (p *Provisioner) stepCreateVM(ctx context.Context, logger *zap.Logger, pctx
 
 	p.clearOOMAttempts(vmName)
 
+	memoryMode := "hard"
+	if data.MinMemory > 0 {
+		memoryMode = "balloon"
+	}
+
 	logger.Info("VM started, waiting for RUNNING state",
 		zap.String("name", vmName),
 		zap.Int("id", vm.ID),
+		zap.Int("memory_mib", data.Memory),
+		zap.Int("min_memory_mib", data.MinMemory),
+		zap.String("memory_mode", memoryMode),
 	)
 
 	return provision.NewRetryInterval(15 * time.Second)
@@ -950,7 +940,42 @@ func (p *Provisioner) translateStartError(
 
 	count := p.recordOOMAttempt(vmName)
 
-	logger.Error("vm.start ENOMEM — TrueNAS host out of free RAM",
+	if p.config.MaxStartOOMAttempts > 0 && count > p.config.MaxStartOOMAttempts {
+		// Permanent failure — surfaces on MachineRequestStatus instead of
+		// continuing to spin. Counter is intentionally NOT cleared here: a
+		// subsequent recreate of the same MachineRequest with a different
+		// memory profile (or after the operator frees host RAM) goes through
+		// Deprovision first, which clears the counter (see Deprovision in
+		// deprovision.go). Provider restart also resets the in-memory map.
+		logger.Error("vm.start ENOMEM permanent failure — OOM retry budget exhausted",
+			zap.Int("vm_id", vmID),
+			zap.String("vm_name", vmName),
+			zap.Int("requested_mib", vmMemoryMiB),
+			zap.Int("attempt", count),
+			zap.Int("max_attempts", p.config.MaxStartOOMAttempts),
+			zap.Error(err),
+		)
+
+		if telemetry.VMsOOMPermanent != nil {
+			// Counter increment is wrapped in a no-op-if-nil guard because
+			// telemetry.initMetrics() runs only when an OTLP endpoint is
+			// configured; tests and CLI-only modes leave the global nil.
+			telemetry.VMsOOMPermanent.Add(context.Background(), 1)
+		}
+
+		// Wrap ErrHostOOM so categorizeError routes to host_oom via
+		// errors.Is — survives any future wording change to the user
+		// message and is robust against unwrapping by upstream code.
+		return fmt.Errorf("TrueNAS host out of memory after %d attempts: cannot start VM %d (%s) requesting %d MiB. "+
+			"Free host RAM (stop another guest), shrink this MachineClass memory, or add physical RAM, then delete this MachineRequest to retry: %w",
+			count, vmID, vmName, vmMemoryMiB, ErrHostOOM)
+	}
+
+	// Retry-phase log goes at Warn, not Error: the recoverable path should
+	// not fill alert dashboards with one Error per attempt × N attempts ×
+	// every concurrent stuck request. Reserve Error for the permanent
+	// branch above (the actionable terminal state).
+	logger.Warn("vm.start ENOMEM — will retry",
 		zap.Int("vm_id", vmID),
 		zap.String("vm_name", vmName),
 		zap.Int("requested_mib", vmMemoryMiB),
@@ -959,19 +984,9 @@ func (p *Provisioner) translateStartError(
 		zap.Error(err),
 	)
 
-	if p.config.MaxStartOOMAttempts > 0 && count > p.config.MaxStartOOMAttempts {
-		// Permanent failure — surfaces on MachineRequestStatus instead of
-		// continuing to spin. Counter is intentionally not cleared: a
-		// subsequent provider restart resets it (in-memory map), at which
-		// point the operator presumably has freed RAM or shrunk the class.
-		return fmt.Errorf("TrueNAS host out of memory after %d attempts: cannot start VM %d (%s) requesting %d MiB. "+
-			"Free host RAM (stop another guest), shrink this MachineClass memory, or add physical RAM, then delete this MachineRequest to retry",
-			count, vmID, vmName, vmMemoryMiB)
-	}
-
 	return fmt.Errorf("TrueNAS host out of memory: cannot start VM %d (%s) requesting %d MiB (attempt %d/%d). "+
-		"Free a guest or shrink this MachineClass — provider will retry: %w",
-		vmID, vmName, vmMemoryMiB, count, p.config.MaxStartOOMAttempts, err)
+		"Free a guest or shrink this MachineClass — provider will retry: %w (root: %w)",
+		vmID, vmName, vmMemoryMiB, count, p.config.MaxStartOOMAttempts, ErrHostOOM, err)
 }
 
 // stepHealthCheck runs on every reconcile after the VM is created.
@@ -1138,55 +1153,184 @@ func applyConfigPatch(ctx context.Context, pctx provision.Context[*resources.Mac
 // categorizeError returns a category string for a provision error.
 func categorizeError(err error) string {
 	if err == nil {
-		return "unknown"
+		return telemetry.ErrCategoryUnknown
+	}
+
+	// Typed predicates run BEFORE substring matching so well-shaped errors
+	// classify deterministically:
+	//   - errors.Is(err, ErrHostOOM)  — set by translateStartError and the
+	//     pre-flight free-RAM rejection. Means the categorizer is not
+	//     reading the package's own free-text wording (which can drift on
+	//     a polish commit and silently break the metric bucket).
+	//   - client.IsNoMemory(err)     — TrueNAS APIError code 12, OR the
+	//     libvirt-relayed message fallback. Catches raw vm.start ENOMEMs
+	//     that bypassed translateStartError (e.g., the post-NVRAM-reset
+	//     path, where the error is logged but not wrapped).
+	switch {
+	case errors.Is(err, ErrHostOOM):
+		return telemetry.ErrCategoryHostOOM
+	case client.IsNoMemory(err):
+		return telemetry.ErrCategoryHostOOM
 	}
 
 	errMsg := err.Error()
 	switch {
 	case strings.Contains(errMsg, "pool") && strings.Contains(errMsg, "not found"):
-		return "pool_not_found"
+		return telemetry.ErrCategoryPoolNotFound
 	case strings.Contains(errMsg, "ENOSPC") || strings.Contains(errMsg, "pool is full"):
-		return "pool_full"
+		return telemetry.ErrCategoryPoolFull
 	// `config_invalid` precedes `nic_invalid` so MachineClass validation
 	// errors (wrapped via "invalid MachineClass config: %w" in stepCreateVM)
 	// route to their own bucket even when the inner message mentions
 	// `additional_nics`. Without this, an operator typo on a CIDR pages the
 	// same alert path as a real TrueNAS NIC-attach failure.
 	case strings.Contains(errMsg, "invalid MachineClass config"):
-		return "config_invalid"
+		return telemetry.ErrCategoryConfigInvalid
 	// `config_patch` covers every CreateConfigPatch failure path (data-volumes,
 	// longhorn-ops, nic-mtu, nic-interfaces, advertised-subnets). Without this,
 	// a patch-emission regression shows up as `unknown` on the dashboard and
 	// on-call has to grep logs to attribute which patch failed.
 	case strings.Contains(errMsg, "config patch"):
-		return "config_patch"
+		return telemetry.ErrCategoryConfigPatch
 	case strings.Contains(errMsg, "network_interface") || strings.Contains(errMsg, "nic_attach") || strings.Contains(errMsg, "NIC"):
-		return "nic_invalid"
+		return telemetry.ErrCategoryNICInvalid
 	case strings.Contains(errMsg, "reconnect") || strings.Contains(errMsg, "unreachable"):
-		return "connection"
+		return telemetry.ErrCategoryConnection
 	case strings.Contains(errMsg, "permission") || strings.Contains(errMsg, "EACCES"):
-		return "auth"
+		return telemetry.ErrCategoryAuth
 	case strings.Contains(errMsg, "timeout") || strings.Contains(errMsg, "deadline"):
-		return "timeout"
-	// `host_oom` precedes `memory` so the runtime ENOMEM (host RAM full at
-	// vm.start time, surfaced via translateStartError or the raw libvirt
-	// "[ENOMEM] Cannot guarantee memory" string) routes to its own bucket.
-	// Without this split, a transient host-OOM during a provisioning storm
-	// pages the same alert as an oversized MachineClass — two very
-	// different operator responses (free a guest vs. fix the manifest).
+		return telemetry.ErrCategoryTimeout
+	// Substring fallback for raw libvirt strings. The typed-predicate
+	// switch above catches any error wrapped through ErrHostOOM or
+	// carrying a TrueNAS APIError; this is only reached for free-text
+	// errors (raw libvirt or third-party wraps).
 	case strings.Contains(errMsg, "[ENOMEM]") ||
-		strings.Contains(errMsg, "Cannot guarantee memory") ||
-		strings.Contains(errMsg, "host out of memory") ||
-		strings.Contains(errMsg, "TrueNAS host has") ||
-		strings.Contains(errMsg, "TrueNAS host is out of free RAM"):
-		return "host_oom"
+		strings.Contains(errMsg, "Cannot guarantee memory"):
+		return telemetry.ErrCategoryHostOOM
 	case strings.Contains(errMsg, "memory") || strings.Contains(errMsg, "RAM"):
-		return "memory"
+		return telemetry.ErrCategoryMemory
 	case strings.Contains(errMsg, "schematic") || strings.Contains(errMsg, "ISO"):
-		return "image"
+		return telemetry.ErrCategoryImage
 	default:
-		return "unknown"
+		return telemetry.ErrCategoryUnknown
 	}
+}
+
+// preflightHostMemory verifies the TrueNAS host has enough free RAM to
+// admit a new VM with the requested memory profile. Two ceilings, both
+// enforced:
+//
+//  1. Single-VM ceiling (80% of total physmem) — guards ZFS ARC starvation.
+//     TrueNAS dynamically reclaims ARC, but a single guest larger than 80%
+//     of total RAM would force ARC to a level where metadata churn dominates
+//     and the box thrashes.
+//
+//  2. Free-RAM ceiling (90% of physmem minus already-running guests) —
+//     guards the runtime ENOMEM that vm.start returns when the host can't
+//     lock guest memory at boot. The original check only looked at total
+//     physmem, so a host with 32 GiB total and 28 GiB already committed to
+//     other VMs would happily accept a new 8 GiB MachineClass — and then
+//     loop forever on `[ENOMEM] Cannot guarantee memory for guest`.
+//
+// Best-effort: if SystemMemoryAvailable fails entirely the function
+// returns nil (defer to runtime ENOMEM detection). If only the
+// running-guest aggregate fails, falls back to the single-VM ceiling and
+// increments truenas.preflight.degraded so on-call has a signal that the
+// safety net is silently off.
+//
+// Rejections that are due to host RAM exhaustion (free-RAM ceiling) wrap
+// ErrHostOOM so categorizeError routes them to the host_oom bucket via
+// errors.Is — the single-VM ceiling does NOT wrap ErrHostOOM because it
+// describes a MachineClass-config problem, not a host-state problem.
+func (p *Provisioner) preflightHostMemory(ctx context.Context, logger *zap.Logger, span trace.Span, data Data) error {
+	hostMem, memErr := p.client.SystemMemoryAvailable(ctx)
+	if memErr != nil {
+		// Defer to runtime ENOMEM detection — pre-flight is best-effort.
+		return nil
+	}
+
+	// The host has to lock min_memory at vm.start (and only min_memory if
+	// balloon is configured). If min_memory is unset the full memory value
+	// is reserved. Comparing against the *actual reservation* avoids
+	// rejecting valid balloon configs that have memory >> host-free but
+	// min_memory < host-free.
+	reservedMiB := int64(data.Memory)
+	if data.MinMemory > 0 {
+		reservedMiB = int64(data.MinMemory)
+	}
+
+	ceilingMiB := int64(data.Memory)
+	hostMiB := hostMem / (1024 * 1024)
+
+	// Span attributes: visible in trace UI without log correlation. On-call
+	// debugging "why did this provision reject?" can read the rejection
+	// reason and the current host state from a single trace.
+	span.SetAttributes(
+		attribute.Int64("preflight.host_mib", hostMiB),
+		attribute.Int64("preflight.ceiling_mib", ceilingMiB),
+		attribute.Int64("preflight.reserved_mib", reservedMiB),
+	)
+
+	if ceilingMiB > hostMiB*80/100 {
+		// Single-VM ceiling violation: NOT wrapped in ErrHostOOM because
+		// this is a MachineClass-config problem (operator typo'd a memory
+		// value larger than the host can ever fit), not a host-state
+		// problem. Routes to the `memory` bucket via the substring
+		// fallback in categorizeError.
+		return fmt.Errorf("MachineClass exceeds host RAM: host has %d MiB total but VM ceiling is %d MiB — "+
+			"a single VM should not exceed 80%% of host RAM (TrueNAS needs the rest for ZFS ARC). "+
+			"Reduce memory or add more host RAM", hostMiB, ceilingMiB)
+	}
+
+	runningMiB, runErr := p.client.RunningGuestsMemoryMiB(ctx)
+	if runErr != nil {
+		// Best-effort degradation: single-VM ceiling above is still in
+		// effect. Bump Warn (not Debug) so a sustained vm.query failure
+		// is visible in log dashboards — sustained degradation is the
+		// leading indicator for the original ENOMEM-loop bug to reappear.
+		logger.Warn("memory pre-flight: running-guest aggregate query failed — free-RAM safety net disabled for this provision",
+			zap.Int64("host_mib", hostMiB),
+			zap.Int64("reserved_mib", reservedMiB),
+			zap.Error(runErr),
+		)
+
+		if telemetry.PreflightDegraded != nil {
+			telemetry.PreflightDegraded.Add(ctx, 1)
+		}
+
+		return nil
+	}
+
+	span.SetAttributes(attribute.Int64("preflight.running_mib", runningMiB))
+
+	freeMiB := hostMiB - runningMiB
+
+	// Wrap field construction in Check so zap doesn't allocate fields when
+	// Debug is filtered. Once-per-provision so impact is small, but trivially
+	// fixable while the code is open.
+	if ce := logger.Check(zapcore.DebugLevel, "memory pre-flight"); ce != nil {
+		ce.Write(
+			zap.Int64("host_mib", hostMiB),
+			zap.Int64("running_mib", runningMiB),
+			zap.Int64("free_mib", freeMiB),
+			zap.Int64("ceiling_mib", ceilingMiB),
+			zap.Int64("reserved_mib", reservedMiB),
+			zap.Int64("free_threshold_mib", freeMiB*90/100),
+		)
+	}
+
+	if reservedMiB > freeMiB*90/100 {
+		balloonHint := ""
+		if data.MinMemory == 0 {
+			balloonHint = " Set min_memory to a smaller value to enable memory ballooning instead of a hard reservation."
+		}
+
+		return fmt.Errorf("TrueNAS host has %d MiB free (%d total minus %d MiB committed to RUNNING guests); "+
+			"VM needs %d MiB reserved at start. Stop another guest, shrink this MachineClass, or add host RAM.%s: %w",
+			freeMiB, hostMiB, runningMiB, reservedMiB, balloonHint, ErrHostOOM)
+	}
+
+	return nil
 }
 
 // validatePool checks that the configured pool exists on TrueNAS.
@@ -1340,7 +1484,13 @@ func (p *Provisioner) swapCDROMForUpgrade(ctx context.Context, logger *zap.Logge
 // resetNVRAMIfNeeded checks if a VM's NVRAM needs resetting (e.g., after OVMF firmware update).
 // TrueNAS VMs may fail to boot after firmware updates if the NVRAM is stale.
 // This is a best-effort operation — failure is non-fatal.
-func (p *Provisioner) resetNVRAMIfNeeded(ctx context.Context, logger *zap.Logger, vmID int) {
+//
+// vmName is required so that an ENOMEM-after-reset properly increments the
+// OOM circuit breaker via recordOOMAttempt — without it the post-NVRAM-reset
+// path silently bypasses the budget that translateStartError enforces, and
+// a host-OOM during firmware-recovery would loop forever instead of
+// surfacing on MachineRequestStatus after MaxStartOOMAttempts.
+func (p *Provisioner) resetNVRAMIfNeeded(ctx context.Context, logger *zap.Logger, vmID int, vmName string) {
 	vm, err := p.client.GetVM(ctx, vmID)
 	if err != nil {
 		return
@@ -1366,8 +1516,20 @@ func (p *Provisioner) resetNVRAMIfNeeded(ctx context.Context, logger *zap.Logger
 		// Try to start the VM after NVRAM reset
 		if err := p.client.StartVM(ctx, vmID); err != nil {
 			if client.IsNoMemory(err) {
-				logger.Error("failed to start VM after NVRAM reset — TrueNAS host out of free RAM",
+				// Funnel through the same OOM circuit breaker as the
+				// primary start path. Without this, an ENOMEM on the
+				// firmware-recovery branch is silently swallowed: the
+				// retry counter never increments, the permanent-failure
+				// surface never trips, and the operator sees the VM
+				// loop in ERROR state with no MachineRequestStatus
+				// signal.
+				count := p.recordOOMAttempt(vmName)
+
+				logger.Warn("failed to start VM after NVRAM reset — TrueNAS host out of free RAM",
 					zap.Int("vm_id", vmID),
+					zap.String("vm_name", vmName),
+					zap.Int("attempt", count),
+					zap.Int("max_attempts", p.config.MaxStartOOMAttempts),
 					zap.Error(err),
 				)
 
@@ -1473,7 +1635,7 @@ func (p *Provisioner) handleExistingVM(ctx context.Context, logger *zap.Logger, 
 			zap.Int("max_recoveries", p.config.MaxErrorRecoveries),
 		)
 
-		p.resetNVRAMIfNeeded(ctx, logger, vm.ID)
+		p.resetNVRAMIfNeeded(ctx, logger, vm.ID, vmName)
 
 		retryErr := provision.NewRetryInterval(30 * time.Second)
 		return &retryErr
