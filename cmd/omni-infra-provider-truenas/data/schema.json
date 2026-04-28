@@ -11,19 +11,21 @@
     },
     "memory": {
       "type": "integer",
-      "title": "Memory (MiB)",
+      "title": "Memory (MiB) — ceiling, must be ≥ min_memory",
       "minimum": 1024,
       "maximum": 16777216,
       "default": 4096,
-      "description": "Maximum / hard memory limit in MiB (max 16 TiB). When min_memory is unset, this value is fully reserved on the TrueNAS host at vm.start — if the host can't guarantee it, the VM fails with ENOMEM. Set min_memory to enable a soft floor with ballooning up to this ceiling."
+      "examples": [2048, 4096, 8192, 16384],
+      "description": "Maximum / hard memory limit in MiB (max 16 TiB). This is the CEILING — when min_memory is set, the VM balloons UP to this value; when min_memory is unset, this value is fully reserved on the TrueNAS host at vm.start (and the VM fails with ENOMEM if the host can't guarantee it). PAIRING RULE: memory MUST be ≥ min_memory. A MachineClass with min_memory > memory fails validation and provisioning will not start."
     },
     "min_memory": {
       "type": ["integer", "null"],
-      "title": "Min Memory (MiB)",
+      "title": "Min Memory (MiB) — floor, must be ≤ memory",
       "minimum": 0,
       "maximum": 16777216,
       "default": 0,
-      "description": "Optional soft memory floor in MiB. When set, the VM starts with min_memory reserved and balloons up to memory as host RAM is available — useful for over-committing on tight hosts. When unset (default), memory is treated as a hard reservation. Must be <= memory. Note: the Talos kernel does not auto-load virtio-balloon, so the VM may run at min_memory until balloon is enabled in-guest; size min_memory to what Talos actually needs (1–2 GiB workers, 2–4 GiB control planes)."
+      "examples": [0, 1024, 2048, 4096],
+      "description": "Optional soft memory floor in MiB. When set, the VM starts with min_memory reserved and balloons up to memory as host RAM is available — useful for over-committing on tight hosts. When unset (default 0), memory is treated as a hard reservation. PAIRING RULE: min_memory MUST be ≤ memory. Setting min_memory > memory is rejected at MachineClass validation. Sizing: 1024–2048 for workers, 2048–4096 for control planes (Talos kernel doesn't auto-load virtio-balloon, so the VM may sit at min_memory until balloon is enabled in-guest — size to what Talos actually needs, not what you wish it would balloon to)."
     },
     "disk_size": {
       "type": "integer",

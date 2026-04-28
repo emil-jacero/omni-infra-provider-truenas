@@ -308,7 +308,8 @@ func (d *Data) Validate() error {
 	}
 
 	if d.MinMemory > d.Memory {
-		return fmt.Errorf("min_memory (%d MiB) must be <= memory (%d MiB) — min_memory is the soft floor; memory is the ceiling the guest can balloon up to", d.MinMemory, d.Memory)
+		return fmt.Errorf("min_memory (%d MiB) must be <= memory (%d MiB). min_memory is the soft floor (reserved at vm.start); memory is the ceiling the guest can balloon up to. To fix: either RAISE memory to >= %d in the MachineClass (current ceiling too low for the requested floor), or LOWER min_memory to <= %d (current floor too high for the requested ceiling). Typical workers: memory=8192, min_memory=2048. Typical control planes: memory=4096, min_memory=2048",
+			d.MinMemory, d.Memory, d.MinMemory, d.Memory)
 	}
 
 	if d.DiskSize < 0 {
