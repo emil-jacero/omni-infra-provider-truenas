@@ -16,10 +16,15 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cosi-project/runtime/pkg/resource"
+	"github.com/cosi-project/runtime/pkg/safe"
+	"github.com/cosi-project/runtime/pkg/state"
 	"github.com/joho/godotenv"
 	"github.com/siderolabs/omni/client/pkg/client"
 	"github.com/siderolabs/omni/client/pkg/client/omni"
 	"github.com/siderolabs/omni/client/pkg/infra"
+	infraresources "github.com/siderolabs/omni/client/pkg/omni/resources/infra"
+	omniresources "github.com/siderolabs/omni/client/pkg/omni/resources/omni"
 	"go.opentelemetry.io/contrib/bridges/otelzap"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -295,15 +300,6 @@ func run() error {
 		return err
 	}
 
-	// Start background cleanup for stale ISOs and orphan VMs/zvols.
-	// Orphan detection uses TrueNAS state (zvol existence) rather than in-memory
-	// tracking, so it's safe across provider restarts.
-	cleaner := cleanup.New(tnClient, cleanup.Config{
-		Pool: defaultPool,
-	}, logger, prov.ActiveImageIDs)
-
-	go cleaner.Run(ctx)
-
 	// Start host health monitor (publishes OTEL gauges)
 	hostMonitor := monitor.New(tnClient, monitor.Config{}, logger)
 
@@ -347,6 +343,47 @@ func run() error {
 	defer func() { _ = omniClient.Close() }()
 
 	omniState := omniClient.Omni().State()
+
+	// Start background cleanup for stale ISOs and orphan VMs/zvols.
+	// Orphan detection has two signals (see internal/cleanup/cleanup.go):
+	//   1. Live cross-reference against the MachineRequest set Omni
+	//      currently knows about — catches the "both VM and zvol alive
+	//      but no MachineRequest" double-orphan case (the f9xkk2
+	//      incident, 2026-04-28).
+	//   2. Partial-orphan heuristic — catches "VM alive, zvol gone"
+	//      and "zvol alive, VM gone" half-completed teardowns.
+	// The closure below implements (1) by listing infra.MachineRequest
+	// resources from Omni's COSI state, label-filtered to this provider.
+	// Returning an error MUST cause the cleanup loop to skip orphan
+	// deletion this cycle — never mass-delete on transient Omni read
+	// failures. The cleanup function handles that fallback explicitly.
+	liveRequestIDs := func(ctx context.Context) (map[string]bool, error) {
+		list, err := safe.StateListAll[*infraresources.MachineRequest](ctx, omniState,
+			state.WithLabelQuery(resource.LabelEqual(omniresources.LabelInfraProviderID, meta.ProviderID)))
+		if err != nil {
+			return nil, fmt.Errorf("list MachineRequests: %w", err)
+		}
+
+		out := make(map[string]bool, list.Len())
+
+		// Iterator is the deprecated API but list.All() (iter.Seq) requires
+		// `range over func` semantics that the toolchain version pinned in
+		// go.mod does not yet allow. Switch to All() once the go.mod minimum
+		// goes to 1.23+ — until then, Iterator is the working path and the
+		// deprecation lint is intentionally suppressed.
+		it := list.Iterator() //nolint:staticcheck
+		for it.Next() {
+			out[it.Value().Metadata().ID()] = true
+		}
+
+		return out, nil
+	}
+
+	cleaner := cleanup.New(tnClient, cleanup.Config{
+		Pool: defaultPool,
+	}, logger, prov.ActiveImageIDs, liveRequestIDs)
+
+	go cleaner.Run(ctx)
 
 	// Acquire the singleton lease before ip.Run so we fail fast if another
 	// instance is already serving this provider ID. Races on provision steps

@@ -177,6 +177,7 @@ func TestIntegration_ISOCleanup_SkipsWhenActive(t *testing.T) {
 		func() map[string]bool {
 			return map[string]bool{"active_test_keep": true}
 		},
+		nil,
 	)
 
 	cleaner.cleanupISOs(ctx)
@@ -244,6 +245,7 @@ func TestIntegration_OrphanVMCleanup(t *testing.T) {
 	// Run cleanup — the tracked VM has a backing zvol, the orphan does not
 	cleaner := New(c, Config{Pool: pool}, logger,
 		func() map[string]bool { return map[string]bool{} },
+		nil,
 	)
 
 	// Build managed zvols list: only the tracked VM has a backing zvol.
@@ -254,7 +256,7 @@ func TestIntegration_OrphanVMCleanup(t *testing.T) {
 		{Path: pool + "/omni-vms/" + trackedRequestID, RequestID: trackedRequestID},
 	}
 
-	cleaner.cleanupOrphanVMs(ctx, managedZvols)
+	cleaner.cleanupOrphanVMs(ctx, managedZvols, nil)
 
 	// Orphan VM should be gone
 	found, err := c.FindVMByName(ctx, orphanName)
@@ -323,6 +325,7 @@ func TestIntegration_OrphanZvolCleanup(t *testing.T) {
 	// Run cleanup — the tracked zvol has a corresponding VM, the orphan does not
 	cleaner := New(c, Config{Pool: pool}, logger,
 		func() map[string]bool { return map[string]bool{} },
+		nil,
 	)
 
 	// Build managed zvols list: both zvols appear as managed.
@@ -332,7 +335,7 @@ func TestIntegration_OrphanZvolCleanup(t *testing.T) {
 		{Path: trackedZvol, RequestID: trackedRequestID},
 	}
 
-	cleaner.cleanupOrphanZvols(ctx, managedZvols)
+	cleaner.cleanupOrphanZvols(ctx, managedZvols, nil)
 
 	// Orphan zvol should be gone — listing child datasets should not include it
 	datasets, err := c.ListChildDatasets(ctx, parentDS)

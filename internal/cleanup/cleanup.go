@@ -26,6 +26,19 @@ type Config struct {
 	OrphanGracePeriod time.Duration // How long to wait before cleaning orphans (default: 30m)
 }
 
+// LiveRequestIDsFunc returns the set of MachineRequest IDs that currently
+// exist in Omni for this provider. The cleanup loop uses this as the
+// AUTHORITATIVE source of truth for "what does Omni know about?" — a
+// managed VM or zvol whose request-id is not in this set is an orphan,
+// regardless of whether its partner side (VM↔zvol) is still present.
+//
+// Returning an error MUST cause the cleanup loop to SKIP orphan deletion
+// for the cycle — never mass-delete on a transient Omni read failure.
+// A nil callback (legacy / test) opts out of the live cross-reference
+// path entirely; cleanup falls back to the partial-orphan heuristic
+// (one side present, other side gone) only.
+type LiveRequestIDsFunc func(ctx context.Context) (map[string]bool, error)
+
 // Cleaner performs periodic cleanup of stale TrueNAS resources.
 type Cleaner struct {
 	client *client.Client
@@ -33,11 +46,19 @@ type Cleaner struct {
 	logger *zap.Logger
 	// activeImageIDs is called to get the set of image IDs currently in use.
 	activeImageIDs func() map[string]bool
+	// liveRequestIDs is called to get the set of MachineRequest IDs
+	// currently registered in Omni for this provider. May be nil; see
+	// LiveRequestIDsFunc godoc for fall-back semantics.
+	liveRequestIDs LiveRequestIDsFunc
 }
 
 // New creates a new Cleaner.
 // activeImageIDs returns the set of image IDs currently in use (for ISO cleanup).
-func New(c *client.Client, cfg Config, logger *zap.Logger, activeImageIDs func() map[string]bool) *Cleaner {
+// liveRequestIDs returns the live MachineRequest set from Omni — pass nil to
+// disable cross-reference cleanup and fall back to partial-orphan heuristics
+// only (legacy behavior; safe but does not catch the "both-sides-alive,
+// no-MachineRequest" double-orphan case).
+func New(c *client.Client, cfg Config, logger *zap.Logger, activeImageIDs func() map[string]bool, liveRequestIDs LiveRequestIDsFunc) *Cleaner {
 	if cfg.CleanupInterval == 0 {
 		cfg.CleanupInterval = time.Hour
 	}
@@ -51,6 +72,7 @@ func New(c *client.Client, cfg Config, logger *zap.Logger, activeImageIDs func()
 		config:         cfg,
 		logger:         logger.Named("cleanup"),
 		activeImageIDs: activeImageIDs,
+		liveRequestIDs: liveRequestIDs,
 	}
 }
 
@@ -88,10 +110,35 @@ func (cl *Cleaner) runOnce(ctx context.Context) {
 	managedZvols, err := cl.client.ListManagedZvols(ctx)
 	if err != nil {
 		cl.logger.Warn("failed to list managed zvols — skipping orphan cleanup", zap.Error(err))
-	} else {
-		cl.cleanupOrphanVMs(ctx, managedZvols)
-		cl.cleanupOrphanZvols(ctx, managedZvols)
+
+		cl.logger.Debug("cleanup cycle complete", zap.Duration("elapsed", time.Since(start)))
+
+		return
 	}
+
+	// Authoritative source: the MachineRequest IDs Omni currently knows
+	// about. A managed resource whose request-id is NOT in this set is
+	// an orphan even if its partner side (VM↔zvol) is still present —
+	// catches the "both alive, no MachineRequest" double-orphan case
+	// the partial-orphan heuristic alone would miss.
+	//
+	// Read failures MUST NOT cause mass deletion. We pass nil through to
+	// the orphan functions, which then fall back to the partial-orphan
+	// heuristic (safer but less aggressive). The Warn log surfaces the
+	// degradation so operators can investigate before the next cycle.
+	var live map[string]bool
+
+	if cl.liveRequestIDs != nil {
+		live, err = cl.liveRequestIDs(ctx)
+		if err != nil {
+			cl.logger.Warn("failed to fetch live MachineRequest set from Omni — orphan cleanup will use partial-orphan heuristic only this cycle (no double-orphan detection)", zap.Error(err))
+
+			live = nil
+		}
+	}
+
+	cl.cleanupOrphanVMs(ctx, managedZvols, live)
+	cl.cleanupOrphanZvols(ctx, managedZvols, live)
 
 	cl.logger.Debug("cleanup cycle complete", zap.Duration("elapsed", time.Since(start)))
 }
@@ -172,11 +219,25 @@ func (cl *Cleaner) cleanupISOs(ctx context.Context) {
 	}
 }
 
-// cleanupOrphanVMs finds VMs with the omni_ prefix whose backing zvol no longer exists.
-// A VM is considered an orphan only when its zvol has been deleted (by Deprovision) but
-// the VM itself was not — indicating a partial cleanup. This avoids any dependency on
-// in-memory state, which is lost on restart.
-func (cl *Cleaner) cleanupOrphanVMs(ctx context.Context, managedZvols []client.ManagedZvol) {
+// cleanupOrphanVMs finds and removes VMs that no longer have a legitimate
+// MachineRequest backing them. Two orphan signals are considered:
+//
+//  1. Live cross-reference (preferred when liveRequests is non-nil): the
+//     VM's request-id is NOT in the live MachineRequest set Omni currently
+//     knows about. Catches the "both VM and zvol alive, no
+//     MachineRequest" double-orphan case the partial-orphan heuristic
+//     misses (was the f9xkk2 incident on 2026-04-28).
+//
+//  2. Partial-orphan heuristic (used always; sole signal when liveRequests
+//     is nil): the VM exists but its backing zvol was deleted by a
+//     completed Deprovision. Indicates a half-completed teardown where
+//     vm.delete failed after pool.dataset.delete succeeded.
+//
+// liveRequests=nil means cross-reference is unavailable (Omni read failed
+// this cycle, or the caller opted out). The function MUST still run with
+// only the partial-orphan signal — never mass-delete on missing
+// authoritative input.
+func (cl *Cleaner) cleanupOrphanVMs(ctx context.Context, managedZvols []client.ManagedZvol, liveRequests map[string]bool) {
 	ctx, span := cleanupTracer.Start(ctx, "cleanup.orphanVMs")
 	defer span.End()
 
@@ -222,16 +283,35 @@ func (cl *Cleaner) cleanupOrphanVMs(ctx context.Context, managedZvols []client.M
 			continue
 		}
 
-		// Check if a backing zvol with this request ID still exists.
-		if managedRequestIDs[requestID] {
+		// Two orphan signals (see function godoc):
+		//   reason="no_machine_request" — live cross-reference says
+		//     Omni doesn't know about this request-id at all. Highest
+		//     confidence; available only when liveRequests is non-nil.
+		//   reason="backing_zvol_missing" — partial deprovision; the
+		//     zvol was deleted but the VM wasn't. Always evaluated.
+		// Both reasons are sufficient on their own. We pick the
+		// higher-confidence reason for the log line so on-call can tell
+		// whether the orphan came from an Omni-side delete (drift /
+		// manual cleanup) or a TrueNAS-side teardown failure (provider
+		// bug / API hiccup).
+		var reason string
+
+		switch {
+		case liveRequests != nil && !liveRequests[requestID]:
+			reason = "no_machine_request"
+		case !managedRequestIDs[requestID]:
+			reason = "backing_zvol_missing"
+		default:
+			// Both checks pass: VM has a MachineRequest in Omni AND
+			// a backing zvol on TrueNAS. Legitimate; skip.
 			continue
 		}
 
-		// Zvol is gone but VM still exists — orphaned from a partial deprovision
-		cl.logger.Info("removing orphan VM (backing zvol not found)",
+		cl.logger.Info("removing orphan VM",
 			zap.String("name", vm.Name),
 			zap.Int("id", vm.ID),
 			zap.String("request_id", requestID),
+			zap.String("reason", reason),
 		)
 
 		if err := cl.client.StopVM(ctx, vm.ID, true); err != nil && !client.IsNotFound(err) {
@@ -247,12 +327,21 @@ func (cl *Cleaner) cleanupOrphanVMs(ctx context.Context, managedZvols []client.M
 	}
 }
 
-// cleanupOrphanZvols finds Omni-managed zvols whose corresponding VM no longer exists.
-// Uses org.omni:managed and org.omni:request-id user properties to find managed zvols
-// across all dataset paths (handles dataset_prefix variations).
-// A zvol is considered an orphan only when its VM has been deleted (by Deprovision) but
-// the zvol itself was not — indicating a partial cleanup.
-func (cl *Cleaner) cleanupOrphanZvols(ctx context.Context, managedZvols []client.ManagedZvol) {
+// cleanupOrphanZvols finds and removes managed zvols whose MachineRequest
+// is gone. Two orphan signals (mirrors cleanupOrphanVMs):
+//
+//  1. Live cross-reference (preferred when liveRequests is non-nil): the
+//     zvol's request-id is NOT in the live MachineRequest set Omni
+//     currently knows about.
+//  2. Partial-orphan heuristic (always evaluated): the zvol exists but
+//     its corresponding VM is gone — completed Deprovision that failed
+//     mid-zvol-cleanup.
+//
+// Naming-shape compatibility: v0.14 VMs were named omni_<requestID>;
+// v0.15+ VMs are namespaced as omni_<providerID>_<requestID>. Both
+// shapes are matched so the partial-orphan check survives a live
+// rolling upgrade across the v0.14→v0.15 boundary.
+func (cl *Cleaner) cleanupOrphanZvols(ctx context.Context, managedZvols []client.ManagedZvol, liveRequests map[string]bool) {
 	ctx, span := cleanupTracer.Start(ctx, "cleanup.orphanZvols")
 	defer span.End()
 
@@ -282,17 +371,26 @@ func (cl *Cleaner) cleanupOrphanZvols(ctx context.Context, managedZvols []client
 		newVMName := meta.BuildVMName(meta.ProviderID, zvol.RequestID)
 		legacyVMName := "omni_" + strings.ReplaceAll(zvol.RequestID, "-", "_")
 
-		if vmNames[newVMName] || vmNames[legacyVMName] {
+		vmExists := vmNames[newVMName] || vmNames[legacyVMName]
+
+		var reason string
+
+		switch {
+		case liveRequests != nil && !liveRequests[zvol.RequestID]:
+			reason = "no_machine_request"
+		case !vmExists:
+			reason = "vm_deleted"
+		default:
+			// Both checks pass: zvol has a live MachineRequest AND
+			// a backing VM. Legitimate; skip.
 			continue
 		}
 
-		vmName := newVMName
-
-		// VM is gone but zvol still exists — orphaned from a partial deprovision
-		cl.logger.Info("removing orphan zvol (VM deleted)",
+		cl.logger.Info("removing orphan zvol",
 			zap.String("path", zvol.Path),
 			zap.String("request_id", zvol.RequestID),
-			zap.String("missing_vm", vmName),
+			zap.String("expected_vm", newVMName),
+			zap.String("reason", reason),
 		)
 
 		if err := cl.client.DeleteDataset(ctx, zvol.Path); err != nil {

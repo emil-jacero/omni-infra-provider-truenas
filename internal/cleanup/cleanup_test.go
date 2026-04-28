@@ -84,6 +84,7 @@ func TestNew_DefaultIntervals(t *testing.T) {
 	c := client.NewMockClient(nil)
 	cl := New(c, Config{Pool: "tank"}, zap.NewNop(),
 		func() map[string]bool { return nil },
+		nil,
 	)
 
 	assert.Equal(t, time.Hour, cl.config.CleanupInterval)
@@ -94,6 +95,7 @@ func TestNew_CustomIntervals(t *testing.T) {
 	c := client.NewMockClient(nil)
 	cl := New(c, Config{Pool: "tank", CleanupInterval: 10 * time.Minute, OrphanGracePeriod: 5 * time.Minute}, zap.NewNop(),
 		func() map[string]bool { return nil },
+		nil,
 	)
 
 	assert.Equal(t, 10*time.Minute, cl.config.CleanupInterval)
@@ -222,7 +224,7 @@ func TestCleanupOrphanVMs_DeletesOrphans(t *testing.T) {
 		return nil, nil
 	}, map[string]bool{})
 
-	cl.cleanupOrphanVMs(context.Background(), managedZvols("active-vm"))
+	cl.cleanupOrphanVMs(context.Background(), managedZvols("active-vm"), nil)
 	assert.Equal(t, []int{2}, deleted, "should only delete orphan omni_ VMs whose zvol is gone")
 }
 
@@ -242,7 +244,7 @@ func TestCleanupOrphanVMs_SkipsNonOmniVMs(t *testing.T) {
 		return nil, nil
 	}, map[string]bool{})
 
-	cl.cleanupOrphanVMs(context.Background(), managedZvols())
+	cl.cleanupOrphanVMs(context.Background(), managedZvols(), nil)
 	assert.False(t, deleteCalled, "should not delete VMs without omni_ prefix")
 }
 
@@ -262,7 +264,7 @@ func TestCleanupOrphanVMs_AllHaveZvols_NoneDeleted(t *testing.T) {
 		return nil, nil
 	}, map[string]bool{})
 
-	cl.cleanupOrphanVMs(context.Background(), managedZvols("vm-1", "vm-2"))
+	cl.cleanupOrphanVMs(context.Background(), managedZvols("vm-1", "vm-2"), nil)
 	assert.False(t, deleteCalled, "should not delete VMs when all have backing zvols")
 }
 
@@ -281,7 +283,7 @@ func TestCleanupOrphanVMs_StopFails_StillDeletes(t *testing.T) {
 		return nil, nil
 	}, map[string]bool{})
 
-	cl.cleanupOrphanVMs(context.Background(), managedZvols()) // No zvols → orphan
+	cl.cleanupOrphanVMs(context.Background(), managedZvols(), nil) // No zvols → orphan
 	assert.True(t, deleted, "should still delete VM even if stop fails")
 }
 
@@ -301,7 +303,7 @@ func TestCleanupOrphanVMs_ProviderRestart_DoesNotDeleteActiveVMs(t *testing.T) {
 		return nil, nil
 	}, map[string]bool{})
 
-	cl.cleanupOrphanVMs(context.Background(), managedZvols("talos-cp-1", "talos-worker-1"))
+	cl.cleanupOrphanVMs(context.Background(), managedZvols("talos-cp-1", "talos-worker-1"), nil)
 	assert.False(t, deleteCalled, "must NOT delete VMs after restart when zvols exist")
 }
 
@@ -318,7 +320,7 @@ func TestCleanupOrphanVMs_ListVMsFails_SkipsCleanup(t *testing.T) {
 		return nil, nil
 	}, map[string]bool{})
 
-	cl.cleanupOrphanVMs(context.Background(), managedZvols())
+	cl.cleanupOrphanVMs(context.Background(), managedZvols(), nil)
 	assert.False(t, deleteCalled, "must not delete VMs when ListVMs fails")
 }
 
@@ -341,7 +343,7 @@ func TestCleanupOrphanZvols_DeletesOrphans(t *testing.T) {
 		return nil, nil
 	}, map[string]bool{})
 
-	cl.cleanupOrphanZvols(context.Background(), managedZvols("active-request-123", "orphan-request-456"))
+	cl.cleanupOrphanZvols(context.Background(), managedZvols("active-request-123", "orphan-request-456"), nil)
 
 	require.Len(t, deleted, 1)
 	assert.Equal(t, "default/omni-vms/orphan-request-456", deleted[0])
@@ -360,7 +362,7 @@ func TestCleanupOrphanZvols_AllHaveVMs_NoneDeleted(t *testing.T) {
 		return nil, nil
 	}, map[string]bool{})
 
-	cl.cleanupOrphanZvols(context.Background(), managedZvols("req-1"))
+	cl.cleanupOrphanZvols(context.Background(), managedZvols("req-1"), nil)
 	assert.False(t, deleteCalled, "should not delete zvols that have corresponding VMs")
 }
 
@@ -382,7 +384,7 @@ func TestCleanupOrphanZvols_DatasetPrefix_FindsZvols(t *testing.T) {
 	}, map[string]bool{})
 
 	deepZvol := []client.ManagedZvol{{Path: "default/previewk8/omni-vms/deep-orphan", RequestID: "deep-orphan"}}
-	cl.cleanupOrphanZvols(context.Background(), deepZvol)
+	cl.cleanupOrphanZvols(context.Background(), deepZvol, nil)
 
 	require.Len(t, deleted, 1)
 	assert.Equal(t, "default/previewk8/omni-vms/deep-orphan", deleted[0])
@@ -401,7 +403,7 @@ func TestCleanupOrphanZvols_ListVMsFails_SkipsCleanup(t *testing.T) {
 		return nil, nil
 	}, map[string]bool{})
 
-	cl.cleanupOrphanZvols(context.Background(), managedZvols("some-req"))
+	cl.cleanupOrphanZvols(context.Background(), managedZvols("some-req"), nil)
 	assert.False(t, deleteCalled, "must not delete zvols when VM query fails")
 }
 
@@ -414,7 +416,7 @@ func TestCleanupOrphanZvols_EmptyManagedZvols_Noop(t *testing.T) {
 		return nil, nil
 	}, map[string]bool{})
 
-	cl.cleanupOrphanZvols(context.Background(), nil)
+	cl.cleanupOrphanZvols(context.Background(), nil, nil)
 	assert.False(t, vmQueryCalled, "should skip VM query when no managed zvols exist")
 }
 
@@ -455,7 +457,7 @@ func TestCleanupOrphanVMs_CrashAfterZvolDelete_CleansUpVM(t *testing.T) {
 		return nil, nil
 	}, map[string]bool{})
 
-	cl.cleanupOrphanVMs(context.Background(), managedZvols()) // No zvols → VM is orphan
+	cl.cleanupOrphanVMs(context.Background(), managedZvols(), nil) // No zvols → VM is orphan
 	assert.True(t, vmDeleted, "should delete VM when its zvol was already deleted by deprovision")
 }
 
@@ -472,7 +474,7 @@ func TestCleanupOrphanZvols_CrashAfterVMDelete_CleansUpZvol(t *testing.T) {
 		return nil, nil
 	}, map[string]bool{})
 
-	cl.cleanupOrphanZvols(context.Background(), managedZvols("crashed-provision"))
+	cl.cleanupOrphanZvols(context.Background(), managedZvols("crashed-provision"), nil)
 	assert.True(t, zvolDeleted, "should delete zvol when its VM was already deleted by deprovision")
 }
 
@@ -489,7 +491,7 @@ func TestCleanupOrphanVMs_FullDeprovisionSuccess_Noop(t *testing.T) {
 		return nil, nil
 	}, map[string]bool{})
 
-	cl.cleanupOrphanVMs(context.Background(), managedZvols())
+	cl.cleanupOrphanVMs(context.Background(), managedZvols(), nil)
 	assert.False(t, deleteCalled, "nothing to clean when deprovision succeeded fully")
 }
 
@@ -506,8 +508,119 @@ func TestCleanupOrphanVMs_ManuallyCreatedOmniVM_NotDeleted(t *testing.T) {
 		return nil, nil
 	}, map[string]bool{})
 
-	cl.cleanupOrphanVMs(context.Background(), managedZvols("manual-test"))
+	cl.cleanupOrphanVMs(context.Background(), managedZvols("manual-test"), nil)
 	assert.False(t, deleteCalled, "should not delete VM when matching zvol exists")
+}
+
+// --- Live-MachineRequest cross-reference (the f9xkk2 fix) ---
+
+// TestCleanupOrphanVMs_LiveCrossRef_DoubleOrphan pins the fix for the
+// "both VM and zvol alive, no MachineRequest in Omni" case the partial-
+// orphan heuristic alone misses. Pre-fix (the f9xkk2 incident, 2026-04-28):
+// a VM whose zvol still existed survived every cleanup cycle for 24+
+// hours despite its MachineRequest being deleted. The live cross-reference
+// catches this on the next cycle.
+func TestCleanupOrphanVMs_LiveCrossRef_DoubleOrphan(t *testing.T) {
+	var deleted []int
+	cl := testCleaner(func(method string, params json.RawMessage) (any, error) {
+		switch method {
+		case "vm.query":
+			return []client.VM{
+				{ID: 1, Name: "omni_truenas_live_one", Description: "Managed by Omni infra provider (request-id: live-one)"},
+				{ID: 2, Name: "omni_truenas_dead_one", Description: "Managed by Omni infra provider (request-id: dead-one)"},
+			}, nil
+		case "vm.stop":
+			return nil, nil
+		case "vm.delete":
+			var p []int
+			_ = json.Unmarshal(params, &p)
+			if len(p) > 0 {
+				deleted = append(deleted, p[0])
+			}
+			return nil, nil
+		}
+		return nil, nil
+	}, map[string]bool{})
+
+	// Both VMs have backing zvols (partial-orphan heuristic alone would
+	// skip them). But Omni only knows about live-one, so dead-one is the
+	// double-orphan we want to catch.
+	zvols := managedZvols("live-one", "dead-one")
+	live := map[string]bool{"live-one": true}
+
+	cl.cleanupOrphanVMs(context.Background(), zvols, live)
+
+	assert.Equal(t, []int{2}, deleted, "should delete only the VM whose request-id is absent from the live MachineRequest set")
+}
+
+// TestCleanupOrphanZvols_LiveCrossRef_DoubleOrphan mirrors the VM test for
+// the zvol path: a managed zvol whose VM is still present but whose
+// MachineRequest is gone must be detected and deleted via the live
+// cross-reference.
+func TestCleanupOrphanZvols_LiveCrossRef_DoubleOrphan(t *testing.T) {
+	var deleted []string
+	cl := testCleaner(func(method string, params json.RawMessage) (any, error) {
+		switch method {
+		case "vm.query":
+			// Both VMs still alive — partial-orphan heuristic would
+			// skip both zvols.
+			return []client.VM{
+				{ID: 1, Name: "omni_truenas_live_two"},
+				{ID: 2, Name: "omni_truenas_dead_two"},
+			}, nil
+		case "pool.dataset.delete":
+			var p []string
+			_ = json.Unmarshal(params, &p)
+			if len(p) > 0 {
+				deleted = append(deleted, p[0])
+			}
+			return nil, nil
+		}
+		return nil, nil
+	}, map[string]bool{})
+
+	zvols := managedZvols("live-two", "dead-two")
+	live := map[string]bool{"live-two": true}
+
+	cl.cleanupOrphanZvols(context.Background(), zvols, live)
+
+	require.Len(t, deleted, 1)
+	assert.Contains(t, deleted[0], "dead-two", "should delete only the zvol whose request-id is absent from the live MachineRequest set")
+}
+
+// TestCleanupOrphanVMs_LiveNil_FallsBackToPartialHeuristic verifies that
+// passing nil for liveRequests preserves legacy behavior (partial-orphan
+// heuristic only). This is the safe fallback when the Omni read fails —
+// must NOT mass-delete based on missing input.
+func TestCleanupOrphanVMs_LiveNil_FallsBackToPartialHeuristic(t *testing.T) {
+	var deleted []int
+	cl := testCleaner(func(method string, params json.RawMessage) (any, error) {
+		switch method {
+		case "vm.query":
+			return []client.VM{
+				{ID: 1, Name: "omni_truenas_with_zvol", Description: "Managed by Omni infra provider (request-id: with-zvol)"},
+				{ID: 2, Name: "omni_truenas_no_zvol", Description: "Managed by Omni infra provider (request-id: no-zvol)"},
+			}, nil
+		case "vm.stop":
+			return nil, nil
+		case "vm.delete":
+			var p []int
+			_ = json.Unmarshal(params, &p)
+			if len(p) > 0 {
+				deleted = append(deleted, p[0])
+			}
+			return nil, nil
+		}
+		return nil, nil
+	}, map[string]bool{})
+
+	// Only one zvol present. With liveRequests=nil, partial-orphan
+	// heuristic deletes the VM whose zvol is missing AND keeps the VM
+	// whose zvol exists. Mass deletion (if liveRequests=nil were treated
+	// as "Omni knows about nothing") must not happen.
+	cl.cleanupOrphanVMs(context.Background(), managedZvols("with-zvol"), nil)
+
+	assert.Equal(t, []int{2}, deleted, "with nil live set, only the partial-orphan (no-zvol) is deleted; with-zvol is preserved")
 }
 
 // --- runOnce integration tests ---
