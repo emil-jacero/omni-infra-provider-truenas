@@ -1,0 +1,27 @@
+{
+  "ignorePaths": [
+    "_tmp/**",
+    "_out/**",
+    "vendor/**",
+    "node_modules/**",
+    "assets/**",
+    "docs/**",
+    "site/**",
+    "**/*.pb.go",
+    "**/*_test.go"
+  ],
+  "priorityPaths": [
+    "internal/client",
+    "internal/provisioner",
+    "internal/singleton",
+    "internal/cleanup",
+    "internal/autoscaler",
+    "internal/monitor",
+    "internal/health",
+    "internal/resources",
+    "internal/telemetry",
+    "cmd",
+    ".github/workflows",
+    "deploy"
+  ]
+}
