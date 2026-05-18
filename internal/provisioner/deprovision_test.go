@@ -105,6 +105,7 @@ func TestCleanupVM_ContextCancelled_DuringGraceful(t *testing.T) {
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	// Cancel after 50ms — should not wait the full graceful timeout
 	go func() {
@@ -118,6 +119,67 @@ func TestCleanupVM_ContextCancelled_DuringGraceful(t *testing.T) {
 
 	// Key assertion: should NOT wait the full graceful timeout
 	assert.Less(t, elapsed, 2*time.Second, "should exit quickly when context cancelled")
+}
+
+// TestCleanupVM_DeleteRunsEvenAfterParentCancel pins the
+// context.WithoutCancel contract: when the parent ctx is cancelled
+// MID-deprovision (after ownership check passes), cleanupVM MUST still
+// call DeleteVM with a context that is not yet cancelled. A regression
+// to `cleanupCtx := ctx` would silently skip the force-stop and delete,
+// leaving orphan VMs to be picked up on the next cleanup cycle. The
+// CHANGELOG promises this contract; this test pins it.
+//
+// The cancellation must fire AFTER GetVM (ownership check) returns,
+// because the rate-limit semaphore in client.call(ctx) short-circuits on
+// pre-cancelled ctx — that's the correct behavior for ownership-check
+// time, and is not what WithoutCancel is protecting.
+func TestCleanupVM_DeleteRunsEvenAfterParentCancel(t *testing.T) {
+	var (
+		queryCalls   atomic.Int32
+		deleteCalls  atomic.Int32
+		deleteCtxOK  atomic.Bool
+		stopForceCtx atomic.Bool
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	p := NewProvisioner(client.NewMockClientCtx(func(callCtx context.Context, method string, _ json.RawMessage) (any, error) {
+		switch method {
+		case "vm.query":
+			// Cancel the parent ctx as soon as the ownership check
+			// completes — simulates an in-flight deprovision interrupted
+			// by a shutdown signal mid-call.
+			queryCalls.Add(1)
+			cancel()
+			return managedVM(99, "RUNNING"), nil
+		case "vm.stop":
+			// Force-stop runs on cleanupCtx (WithoutCancel); record
+			// whether the ctx visible at the mock is alive.
+			if callCtx.Err() == nil {
+				stopForceCtx.Store(true)
+			}
+			return true, nil
+		case "vm.delete":
+			deleteCalls.Add(1)
+			if callCtx.Err() == nil {
+				deleteCtxOK.Store(true)
+			}
+			return true, nil
+		default:
+			return nil, nil
+		}
+	}), ProviderConfig{
+		DefaultPool:             "tank",
+		GracefulShutdownTimeout: 50 * time.Millisecond,
+		PollInterval:            10 * time.Millisecond,
+	})
+
+	_ = p.cleanupVM(ctx, testLogger(), 99)
+
+	assert.Equal(t, int32(1), deleteCalls.Load(), "DeleteVM must run even when parent ctx is cancelled mid-flight")
+	assert.True(t, deleteCtxOK.Load(), "DeleteVM ctx must NOT be cancelled (proves WithoutCancel contract)")
+	assert.True(t, stopForceCtx.Load(), "force-StopVM ctx must NOT be cancelled either")
 }
 
 func TestCleanupVM_VMAlreadyStopped(t *testing.T) {

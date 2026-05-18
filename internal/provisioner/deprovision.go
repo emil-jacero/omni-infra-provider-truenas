@@ -2,19 +2,28 @@ package provisioner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/siderolabs/omni/client/pkg/omni/resources/infra"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
+	"github.com/bearbinary/omni-infra-provider-truenas/internal/client"
 	"github.com/bearbinary/omni-infra-provider-truenas/internal/resources"
 	"github.com/bearbinary/omni-infra-provider-truenas/internal/resources/meta"
 	"github.com/bearbinary/omni-infra-provider-truenas/internal/telemetry"
 )
+
+// errVMNotFound is the sentinel returned by fetchOwnedVM when the VM does
+// not exist on TrueNAS. The cleanup path treats this as "already gone" and
+// returns nil — but callers must distinguish it from real errors via
+// errors.Is, not via (nil, nil).
+var errVMNotFound = errors.New("vm not found on TrueNAS during cleanup")
 
 // Deprovision tears down the VM and cleans up storage.
 func (p *Provisioner) Deprovision(ctx context.Context, logger *zap.Logger, machine *resources.Machine, req *infra.MachineRequest) (err error) {
@@ -48,8 +57,8 @@ func (p *Provisioner) Deprovision(ctx context.Context, logger *zap.Logger, machi
 		return err
 	}
 
-	// Use background context for zvol cleanup — must complete even if original ctx cancelled
-	cleanupCtx := context.Background()
+	// Cleanup must survive ctx cancellation but keep trace IDs from parent.
+	cleanupCtx := context.WithoutCancel(ctx)
 
 	// Clean up additional data disks first (order doesn't matter, but root disk last)
 	for _, zvolPath := range state.AdditionalZvolPaths {
@@ -101,58 +110,26 @@ func (p *Provisioner) cleanupVM(ctx context.Context, logger *zap.Logger, vmID in
 		return nil
 	}
 
-	// Ownership check: refuse to touch a VM that isn't ours. A name collision
-	// (second provider, manual create, stale state) could otherwise cause us
-	// to shut down and delete something we didn't create.
-	vm, err := p.client.GetVM(ctx, vmID)
-	if err != nil {
-		if isNotFound(err) {
-			logger.Debug("VM not found during cleanup — nothing to do", zap.Int("vm_id", vmID))
+	if _, err := p.fetchOwnedVM(ctx, logger, vmID); err != nil {
+		if errors.Is(err, errVMNotFound) {
 			return nil
 		}
-
-		return fmt.Errorf("failed to read VM %d for ownership check: %w", vmID, err)
+		return err
 	}
 
-	if !isOmniManagedVM(vm) {
-		return fmt.Errorf("refusing to deprovision VM %d (%q): description %q does not match Omni management marker — a name collision or state corruption has mixed up ownership, investigate on TrueNAS before retrying",
-			vmID, vm.Name, vm.Description)
-	}
+	stopped := p.gracefullyStopVM(ctx, logger, vmID)
 
-	// Graceful shutdown: try ACPI signal first, then force after timeout
-	logger.Debug("requesting graceful VM shutdown", zap.Int("vm_id", vmID))
-
-	if err := p.client.StopVM(ctx, vmID, false); err != nil && !isNotFound(err) {
-		// ACPI signal may fail if VM is already stopped or has no guest agent — that's fine
-		logger.Debug("graceful shutdown signal failed, will force stop", zap.Int("vm_id", vmID), zap.Error(err))
-	}
-
-	// Wait for graceful shutdown.
-	// GracefulShutdownTimeout < 0 means force-stop immediately (skip graceful).
-	gracefulTimeout := p.config.GracefulShutdownTimeout
-	if gracefulTimeout < 0 {
-		gracefulTimeout = 0
-	}
-
-	if gracefulTimeout == 0 {
-		// Default: 30s graceful timeout
-		gracefulTimeout = 30 * time.Second
-	}
-
-	stopped := p.waitForGracefulStop(ctx, logger, vmID, gracefulTimeout)
-
+	gracefulAttrs := metric.WithAttributes(attribute.String("provider_id", meta.ProviderID))
 	if stopped {
 		if telemetry.GracefulShutdownSuccess != nil {
-			telemetry.GracefulShutdownSuccess.Add(ctx, 1)
+			telemetry.GracefulShutdownSuccess.Add(ctx, 1, gracefulAttrs)
 		}
-	} else {
-		if telemetry.GracefulShutdownTimeout != nil {
-			telemetry.GracefulShutdownTimeout.Add(ctx, 1)
-		}
+	} else if telemetry.GracefulShutdownTimeout != nil {
+		telemetry.GracefulShutdownTimeout.Add(ctx, 1, gracefulAttrs)
 	}
 
-	// Use background context for cleanup — must complete even if original ctx is cancelled
-	cleanupCtx := context.Background()
+	// Cleanup must survive ctx cancellation but keep trace IDs from parent.
+	cleanupCtx := context.WithoutCancel(ctx)
 
 	if !stopped {
 		logger.Debug("graceful shutdown incomplete, force stopping", zap.Int("vm_id", vmID))
@@ -170,6 +147,54 @@ func (p *Provisioner) cleanupVM(ctx context.Context, logger *zap.Logger, vmID in
 
 	return nil
 }
+
+// fetchOwnedVM verifies the VM exists and is Omni-managed. Returns
+// errVMNotFound when the VM is already gone (caller treats as success);
+// returns an ownership-mismatch error for name collision / state corruption.
+// Callers MUST distinguish via errors.Is(err, errVMNotFound) — refusing to
+// touch a VM we didn't create is the only safe response to a collision.
+func (p *Provisioner) fetchOwnedVM(ctx context.Context, logger *zap.Logger, vmID int) (*client.VM, error) {
+	vm, err := p.client.GetVM(ctx, vmID)
+	if err != nil {
+		if isNotFound(err) {
+			logger.Debug("VM not found during cleanup — nothing to do", zap.Int("vm_id", vmID))
+			return nil, errVMNotFound
+		}
+
+		return nil, fmt.Errorf("failed to read VM %d for ownership check: %w", vmID, err)
+	}
+
+	if !isOmniManagedVM(vm) {
+		return nil, fmt.Errorf("refusing to deprovision VM %d (%q): description %q does not match Omni management marker — a name collision or state corruption has mixed up ownership, investigate on TrueNAS before retrying",
+			vmID, vm.Name, vm.Description)
+	}
+
+	return vm, nil
+}
+
+// gracefullyStopVM issues an ACPI stop and waits up to the configured timeout
+// for the VM to enter STOPPED. Returns true on graceful exit, false on
+// timeout / ctx cancel — the caller is responsible for force-stop on false.
+func (p *Provisioner) gracefullyStopVM(ctx context.Context, logger *zap.Logger, vmID int) bool {
+	logger.Debug("requesting graceful VM shutdown", zap.Int("vm_id", vmID))
+
+	if err := p.client.StopVM(ctx, vmID, false); err != nil && !isNotFound(err) {
+		// ACPI signal may fail if VM is already stopped or has no guest agent — that's fine
+		logger.Debug("graceful shutdown signal failed, will force stop", zap.Int("vm_id", vmID), zap.Error(err))
+	}
+
+	// GracefulShutdownTimeout < 0 means force-stop immediately (skip graceful).
+	gracefulTimeout := p.config.GracefulShutdownTimeout
+	if gracefulTimeout < 0 {
+		gracefulTimeout = 0
+	}
+	if gracefulTimeout == 0 {
+		gracefulTimeout = 30 * time.Second
+	}
+
+	return p.waitForGracefulStop(ctx, logger, vmID, gracefulTimeout)
+}
+
 
 // waitForGracefulStop polls the VM state until it's STOPPED or the timeout/context expires.
 // Returns true if the VM stopped gracefully, false if timeout or context cancelled.

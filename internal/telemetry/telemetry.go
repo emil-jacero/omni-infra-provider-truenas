@@ -59,6 +59,9 @@ func Init(ctx context.Context, cfg Config) (shutdown func(context.Context) error
 
 	var shutdownFuncs []func(context.Context) error
 
+	// Capture shutdownFuncs by reference — appended to below after the
+	// short-circuit return path. The closure runs at shutdown time and
+	// joins any errors from the registered exporters.
 	shutdown = func(ctx context.Context) error {
 		var errs []error
 		for _, fn := range shutdownFuncs {
@@ -69,7 +72,6 @@ func Init(ctx context.Context, cfg Config) (shutdown func(context.Context) error
 		if len(errs) > 0 {
 			return errors.Join(errs...)
 		}
-
 		return nil
 	}
 

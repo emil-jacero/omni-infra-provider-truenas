@@ -7,6 +7,11 @@ import (
 	"net"
 )
 
+const (
+	methodPoolDatasetQuery = "pool.dataset.query"
+	errPoolDatasetQueryFmt = "pool.dataset.query %q failed: %w"
+)
+
 // UserProperty is a key-value pair for ZFS user properties.
 // TrueNAS 25.10+ expects user_properties as a list of objects, not a map.
 type UserProperty struct {
@@ -139,8 +144,8 @@ func (c *Client) IsDatasetLocked(ctx context.Context, path string) (bool, error)
 		Locked bool `json:"locked"`
 	}
 
-	if err := c.call(ctx, "pool.dataset.query", filter, &ds); err != nil {
-		return false, fmt.Errorf("pool.dataset.query %q failed: %w", path, err)
+	if err := c.call(ctx, methodPoolDatasetQuery, filter, &ds); err != nil {
+		return false, fmt.Errorf(errPoolDatasetQueryFmt, path, err)
 	}
 
 	return ds.Locked, nil
@@ -201,8 +206,8 @@ func (c *Client) GetDatasetUserProperties(ctx context.Context, path string) (map
 		} `json:"user_properties"`
 	}
 
-	if err := c.call(ctx, "pool.dataset.query", filter, &ds); err != nil {
-		return nil, fmt.Errorf("pool.dataset.query %q failed: %w", path, err)
+	if err := c.call(ctx, methodPoolDatasetQuery, filter, &ds); err != nil {
+		return nil, fmt.Errorf(errPoolDatasetQueryFmt, path, err)
 	}
 
 	out := make(map[string]string, len(ds.UserProperties))
@@ -236,8 +241,8 @@ func (c *Client) DatasetExists(ctx context.Context, path string) (bool, error) {
 		ID string `json:"id"`
 	}
 
-	if err := c.call(ctx, "pool.dataset.query", filter, &datasets); err != nil {
-		return false, fmt.Errorf("pool.dataset.query %q failed: %w", path, err)
+	if err := c.call(ctx, methodPoolDatasetQuery, filter, &datasets); err != nil {
+		return false, fmt.Errorf(errPoolDatasetQueryFmt, path, err)
 	}
 
 	return len(datasets) > 0, nil
@@ -260,7 +265,7 @@ func (c *Client) ListManagedZvols(ctx context.Context) ([]ManagedZvol, error) {
 		} `json:"user_properties"`
 	}
 
-	if err := c.call(ctx, "pool.dataset.query", []any{
+	if err := c.call(ctx, methodPoolDatasetQuery, []any{
 		[]any{[]any{"type", "=", "VOLUME"}},
 		map[string]any{"extra": map[string]any{"retrieve_user_props": true}},
 	}, &datasets); err != nil {
@@ -404,7 +409,7 @@ func (c *Client) ListChildDatasets(ctx context.Context, parentPath string) ([]Da
 
 	var datasets []Dataset
 
-	if err := c.call(ctx, "pool.dataset.query", filter, &datasets); err != nil {
+	if err := c.call(ctx, methodPoolDatasetQuery, filter, &datasets); err != nil {
 		return nil, fmt.Errorf("pool.dataset.query (parent=%s) failed: %w", parentPath, err)
 	}
 
@@ -427,8 +432,8 @@ func (c *Client) GetZvolSize(ctx context.Context, path string) (int64, error) {
 		} `json:"volsize"`
 	}
 
-	if err := c.call(ctx, "pool.dataset.query", filter, &ds); err != nil {
-		return 0, fmt.Errorf("pool.dataset.query %q failed: %w", path, err)
+	if err := c.call(ctx, methodPoolDatasetQuery, filter, &ds); err != nil {
+		return 0, fmt.Errorf(errPoolDatasetQueryFmt, path, err)
 	}
 
 	return ds.Volsize.Parsed, nil

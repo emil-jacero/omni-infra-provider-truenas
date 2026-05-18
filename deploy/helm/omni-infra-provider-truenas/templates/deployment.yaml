@@ -21,6 +21,10 @@ spec:
         checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
         {{- end }}
     spec:
+      # Provider talks to Omni over gRPC + TrueNAS over WebSocket; it never
+      # reads the Kubernetes API. Refusing the token avoids handing a SA
+      # credential to a container that has no business with cluster RBAC.
+      automountServiceAccountToken: false
       containers:
         - name: provider
           {{- if .Values.image.digest }}

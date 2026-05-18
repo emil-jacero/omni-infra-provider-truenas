@@ -178,23 +178,9 @@ func run() error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGHUP, syscall.SIGTERM)
 	defer cancel()
 
-	loggerConfig := zap.NewProductionConfig()
-
-	logLevel := os.Getenv("LOG_LEVEL")
-	switch logLevel {
-	case "debug":
-		loggerConfig.Level.SetLevel(zap.DebugLevel)
-	case "warn":
-		loggerConfig.Level.SetLevel(zap.WarnLevel)
-	case "error":
-		loggerConfig.Level.SetLevel(zap.ErrorLevel)
-	default:
-		loggerConfig.Level.SetLevel(zap.InfoLevel)
-	}
-
-	logger, err := loggerConfig.Build(zap.AddStacktrace(zapcore.ErrorLevel))
+	logger, err := buildLogger()
 	if err != nil {
-		return fmt.Errorf("failed to create logger: %w", err)
+		return err
 	}
 
 	// Capture secret-carrying env vars into locals, then unset so they can't be
@@ -403,68 +389,12 @@ func run() error {
 	// instance is already serving this provider ID. Races on provision steps
 	// (VM create, zvol create, ISO upload) across two processes are
 	// effectively impossible to recover from, so we'd rather crashloop loudly.
-	var lease *singleton.Lease
-
-	if envBool("PROVIDER_SINGLETON_ENABLED", true) {
-		lease, err = singleton.New(omniState, singleton.Config{
-			ProviderID:      meta.ProviderID,
-			RefreshInterval: envDuration("PROVIDER_SINGLETON_REFRESH_INTERVAL", singleton.DefaultRefreshInterval),
-			StaleAfter:      envDuration("PROVIDER_SINGLETON_STALE_AFTER", singleton.DefaultStaleAfter),
-			OnRefreshError: func() {
-				if telemetry.SingletonRefreshErrors != nil {
-					telemetry.SingletonRefreshErrors.Add(ctx, 1)
-				}
-			},
-		}, logger)
-		if err != nil {
-			return fmt.Errorf("failed to build singleton lease: %w", err)
-		}
-
-		if err := lease.Acquire(ctx); err != nil {
-			return fmt.Errorf("singleton lease acquire failed: %w", err)
-		}
-
-		// Track lease acquisition
-		if telemetry.SingletonLeaseHeld != nil {
-			telemetry.SingletonLeaseHeld.Record(ctx, 1)
-		}
-
-		if lease.WasTakeover() && telemetry.SingletonTakeovers != nil {
-			telemetry.SingletonTakeovers.Add(ctx, 1)
-		}
-
-		defer func() {
-			releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer releaseCancel()
-			lease.Release(releaseCtx)
-
-			if telemetry.SingletonLeaseHeld != nil {
-				telemetry.SingletonLeaseHeld.Record(releaseCtx, 0)
-			}
-		}()
-
-		go func() {
-			if runErr := lease.Run(ctx); runErr != nil {
-				logger.Error("singleton lease refresh loop exited with error", zap.Error(runErr))
-			}
-		}()
-
-		go func() {
-			select {
-			case <-ctx.Done():
-			case <-lease.Lost():
-				logger.Error("singleton lease lost — cancelling root context to shut down")
-
-				if telemetry.SingletonLeaseHeld != nil {
-					telemetry.SingletonLeaseHeld.Record(ctx, 0)
-				}
-
-				cancel()
-			}
-		}()
-	} else {
-		logger.Warn("singleton enforcement disabled via PROVIDER_SINGLETON_ENABLED=false — " +
-			"running multiple instances with the same PROVIDER_ID will cause provisioning races")
+	release, err := acquireProviderLease(ctx, cancel, omniState, logger)
+	if err != nil {
+		return err
+	}
+	if release != nil {
+		defer release()
 	}
 
 	return ip.Run(ctx, logger,
@@ -473,6 +403,100 @@ func run() error {
 		infra.WithConcurrency(uint(concurrency)),
 		infra.WithHealthCheckFunc(newHealthCheck(tnClient, defaultPool, defaultNetworkInterface)),
 	)
+}
+
+// buildLogger constructs the production zap logger and honors LOG_LEVEL.
+// Lifted out of run() so the log-level switch + Build error path don't
+// occupy four branches of run()'s cognitive complexity budget.
+func buildLogger() (*zap.Logger, error) {
+	loggerConfig := zap.NewProductionConfig()
+
+	switch os.Getenv("LOG_LEVEL") {
+	case "debug":
+		loggerConfig.Level.SetLevel(zap.DebugLevel)
+	case "warn":
+		loggerConfig.Level.SetLevel(zap.WarnLevel)
+	case "error":
+		loggerConfig.Level.SetLevel(zap.ErrorLevel)
+	default:
+		loggerConfig.Level.SetLevel(zap.InfoLevel)
+	}
+
+	logger, err := loggerConfig.Build(zap.AddStacktrace(zapcore.ErrorLevel))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create logger: %w", err)
+	}
+
+	return logger, nil
+}
+
+// acquireProviderLease builds and acquires the provider's singleton lease
+// (when PROVIDER_SINGLETON_ENABLED=true), wires up the refresh + lost
+// goroutines, and returns a release function for the caller to defer. When
+// the lease is disabled, returns (nil, nil) and logs a warning. Crashloop
+// behaviour on acquire failure is preserved — races on provision steps
+// across two processes are not recoverable, so failing fast is the contract.
+func acquireProviderLease(ctx context.Context, cancel context.CancelFunc, omniState state.State, logger *zap.Logger) (release func(), err error) {
+	if !envBool("PROVIDER_SINGLETON_ENABLED", true) {
+		logger.Warn("singleton enforcement disabled via PROVIDER_SINGLETON_ENABLED=false — " +
+			"running multiple instances with the same PROVIDER_ID will cause provisioning races")
+		return nil, nil
+	}
+
+	lease, err := singleton.New(omniState, singleton.Config{
+		ProviderID:      meta.ProviderID,
+		RefreshInterval: envDuration("PROVIDER_SINGLETON_REFRESH_INTERVAL", singleton.DefaultRefreshInterval),
+		StaleAfter:      envDuration("PROVIDER_SINGLETON_STALE_AFTER", singleton.DefaultStaleAfter),
+		OnRefreshError: func() {
+			if telemetry.SingletonRefreshErrors != nil {
+				telemetry.SingletonRefreshErrors.Add(ctx, 1)
+			}
+		},
+	}, logger)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build singleton lease: %w", err)
+	}
+
+	if err := lease.Acquire(ctx); err != nil {
+		return nil, fmt.Errorf("singleton lease acquire failed: %w", err)
+	}
+
+	if telemetry.SingletonLeaseHeld != nil {
+		telemetry.SingletonLeaseHeld.Record(ctx, 1)
+	}
+	if lease.WasTakeover() && telemetry.SingletonTakeovers != nil {
+		telemetry.SingletonTakeovers.Add(ctx, 1)
+	}
+
+	go func() {
+		if runErr := lease.Run(ctx); runErr != nil {
+			logger.Error("singleton lease refresh loop exited with error", zap.Error(runErr))
+		}
+	}()
+
+	go func() {
+		select {
+		case <-ctx.Done():
+		case <-lease.Lost():
+			logger.Error("singleton lease lost — cancelling root context to shut down")
+			if telemetry.SingletonLeaseHeld != nil {
+				telemetry.SingletonLeaseHeld.Record(ctx, 0)
+			}
+			cancel()
+		}
+	}()
+
+	release = func() {
+		releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer releaseCancel()
+		lease.Release(releaseCtx)
+
+		if telemetry.SingletonLeaseHeld != nil {
+			telemetry.SingletonLeaseHeld.Record(releaseCtx, 0)
+		}
+	}
+
+	return release, nil
 }
 
 func envDuration(key string, defaultVal time.Duration) time.Duration {

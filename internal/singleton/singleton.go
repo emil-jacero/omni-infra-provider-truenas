@@ -94,6 +94,12 @@ func (e *LeaseHeldError) Is(target error) bool {
 }
 
 // Clock is the time source used by a Lease. Tests override this.
+// The name intentionally matches the established Go ecosystem convention
+// (uber-go/clock, benbjohnson/clock) rather than the dogmatic "Nower"
+// single-method-interface form — readability across the test suite wins
+// over the lint rule here.
+//
+//nolint:revive // see comment above
 type Clock interface {
 	Now() time.Time
 }

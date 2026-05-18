@@ -6,8 +6,8 @@
 #
 # Distroless: no shell, no package manager, no OS vulnerabilities.
 # ca-certificates are included in the static image.
-# The :nonroot tag defaults to uid/gid 65532. We override to 65534 below.
-FROM gcr.io/distroless/static-debian12:nonroot@sha256:a9329520abc449e3b14d5bc3a6ffae065bdde0f02667fa10880c49b35c109fd1
+# Digest pins gcr.io/distroless/static-debian12:nonroot (uid/gid 65532; we override to 65534 below).
+FROM gcr.io/distroless/static-debian12@sha256:a9329520abc449e3b14d5bc3a6ffae065bdde0f02667fa10880c49b35c109fd1
 
 LABEL org.opencontainers.image.title="omni-infra-provider-truenas" \
       org.opencontainers.image.description="TrueNAS SCALE infrastructure provider for Sidero Omni" \

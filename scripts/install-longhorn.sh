@@ -23,9 +23,9 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m'
 
-info() { echo -e "${YELLOW}[INFO]${NC} $1"; }
-pass() { echo -e "${GREEN}[DONE]${NC} $1"; }
-fail() { echo -e "${RED}[FAIL]${NC} $1"; exit 1; }
+info() { local msg="$1"; echo -e "${YELLOW}[INFO]${NC} ${msg}"; }
+pass() { local msg="$1"; echo -e "${GREEN}[DONE]${NC} ${msg}"; }
+fail() { local msg="$1"; echo -e "${RED}[FAIL]${NC} ${msg}"; exit 1; }
 
 # ─── Args ───
 CLUSTER="${1:-}"

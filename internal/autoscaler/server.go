@@ -347,49 +347,8 @@ func (s *Server) NodeGroupIncreaseSize(ctx context.Context, req *pb.NodeGroupInc
 		return nil, status.Errorf(codes.NotFound, "NodeGroupIncreaseSize: node group %q not found", id)
 	}
 
-	// Capacity gate — only when one is wired. Early experimental
-	// deploys pass a nil CapacityQuery to Server; skipping the gate
-	// is operationally equivalent to MinPoolFreeGiB=0 +
-	// MinHostMemGiB=0.
-	if s.gate != nil {
-		pool := group.Pool
-		if pool == "" {
-			pool = s.defaultPool
-		}
-
-		decision := CheckCapacity(ctx, s.gate, *group.Config, pool)
-
-		switch decision.Outcome {
-		case OutcomeDeniedHard:
-			s.logger.Warn("NodeGroupIncreaseSize: capacity gate denied",
-				zap.String("group", id),
-				zap.Int("delta", delta),
-				zap.String("reason", decision.Reason),
-			)
-
-			recordScaleUpResult(ctx, ResultDeniedCapacity)
-			recordCapacityDenial(ctx, categorizeDenialReason(decision.Reason))
-
-			return nil, status.Errorf(codes.ResourceExhausted, "capacity gate denied: %s", decision.Reason)
-		case OutcomeErrored:
-			s.logger.Warn("NodeGroupIncreaseSize: capacity gate errored (fails closed)",
-				zap.String("group", id),
-				zap.String("reason", decision.Reason),
-			)
-
-			recordScaleUpResult(ctx, ResultErroredInternal)
-			recordCapacityDenial(ctx, ReasonQueryFailed)
-
-			return nil, status.Errorf(codes.Unavailable, "capacity gate query failed: %s", decision.Reason)
-		case OutcomeWarnedSoft:
-			s.logger.Warn("NodeGroupIncreaseSize: capacity gate soft-warn, proceeding",
-				zap.String("group", id),
-				zap.Int("delta", delta),
-				zap.String("reason", decision.Reason),
-			)
-		case OutcomeAllowed:
-			// Nominal path — no log, the post-write log below covers it.
-		}
+	if err := s.evaluateCapacityGate(ctx, group, id, delta); err != nil {
+		return nil, err
 	}
 
 	newSize, err := s.writer.IncreaseMachineCount(ctx, *group, delta)
@@ -415,6 +374,58 @@ func (s *Server) NodeGroupIncreaseSize(ctx context.Context, req *pb.NodeGroupInc
 	recordScaleUpResult(ctx, ResultSucceeded)
 
 	return &pb.NodeGroupIncreaseSizeResponse{}, nil
+}
+
+// evaluateCapacityGate runs the optional capacity gate for an increase
+// request. A nil gate is operationally equivalent to MinPoolFreeGiB=0 +
+// MinHostMemGiB=0 and short-circuits to allow. Hard-deny and errored
+// outcomes return a gRPC status; soft-warn and allow return nil so the
+// caller proceeds to the writer.
+func (s *Server) evaluateCapacityGate(ctx context.Context, group *NodeGroup, id string, delta int) error {
+	if s.gate == nil {
+		return nil
+	}
+
+	pool := group.Pool
+	if pool == "" {
+		pool = s.defaultPool
+	}
+
+	decision := CheckCapacity(ctx, s.gate, *group.Config, pool)
+
+	switch decision.Outcome {
+	case OutcomeDeniedHard:
+		s.logger.Warn("NodeGroupIncreaseSize: capacity gate denied",
+			zap.String("group", id),
+			zap.Int("delta", delta),
+			zap.String("reason", decision.Reason),
+		)
+
+		recordScaleUpResult(ctx, ResultDeniedCapacity)
+		recordCapacityDenial(ctx, categorizeDenialReason(decision.Reason))
+
+		return status.Errorf(codes.ResourceExhausted, "capacity gate denied: %s", decision.Reason)
+	case OutcomeErrored:
+		s.logger.Warn("NodeGroupIncreaseSize: capacity gate errored (fails closed)",
+			zap.String("group", id),
+			zap.String("reason", decision.Reason),
+		)
+
+		recordScaleUpResult(ctx, ResultErroredInternal)
+		recordCapacityDenial(ctx, ReasonQueryFailed)
+
+		return status.Errorf(codes.Unavailable, "capacity gate query failed: %s", decision.Reason)
+	case OutcomeWarnedSoft:
+		s.logger.Warn("NodeGroupIncreaseSize: capacity gate soft-warn, proceeding",
+			zap.String("group", id),
+			zap.Int("delta", delta),
+			zap.String("reason", decision.Reason),
+		)
+	case OutcomeAllowed:
+		// Nominal path — no log; the post-write log covers it.
+	}
+
+	return nil
 }
 
 // NodeGroupDecreaseTargetSize and NodeGroupDeleteNodes are the

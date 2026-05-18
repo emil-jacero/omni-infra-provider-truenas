@@ -2,13 +2,22 @@ package main
 
 import (
 	"context"
+	"errors"
 	"testing"
 
+	"github.com/cosi-project/runtime/pkg/state"
+	"github.com/cosi-project/runtime/pkg/state/impl/inmem"
+	"github.com/cosi-project/runtime/pkg/state/impl/namespaced"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap/zaptest"
 
 	"github.com/bearbinary/omni-infra-provider-truenas/internal/autoscaler"
 )
+
+func newTestOmniState() state.State {
+	return state.WrapCore(namespaced.NewState(inmem.Build))
+}
 
 // TestRunAutoscaler_MissingClusterName mirrors the provisioner's
 // TestSmoke_MissingOmniEndpoint shape — the subcommand must fail with a
@@ -75,4 +84,76 @@ func TestRunAutoscaler_ShutsDownCleanlyOnContextCancel(t *testing.T) {
 	// panic. The runAutoscaler impl treats context.Canceled as a clean
 	// shutdown signal and returns nil.
 	assert.NoError(t, err, "pre-cancelled context must shut down cleanly")
+}
+
+// TestBuildAutoscalerCapacityGate_HostUnset_ReturnsNilQuery pins the
+// dry-run contract: with TRUENAS_HOST unset, the helper returns a bundle
+// with a nil Query (gate disabled) and a safe-to-call Close.
+func TestBuildAutoscalerCapacityGate_HostUnset_ReturnsNilQuery(t *testing.T) {
+	t.Setenv("TRUENAS_HOST", "")
+
+	bundle, err := buildAutoscalerCapacityGate(zaptest.NewLogger(t))
+	require.NoError(t, err)
+	require.NotNil(t, bundle, "bundle must be non-nil even when gate is disabled")
+	assert.Nil(t, bundle.Query, "Query must be nil when host is unset (gate disabled)")
+	assert.Equal(t, "", bundle.DefaultPool)
+
+	// Close must not panic — it's the unconditional defer at the caller.
+	assert.NotPanics(t, func() { bundle.Close() })
+}
+
+// The enabled-path counterpart (TRUENAS_HOST set → bundle.Query
+// non-nil) is exercised by the cassette/integration tests that have
+// real or replayed WebSocket connectivity. A unit test here would need
+// a mock TrueNAS WebSocket, which is out of scope for cmd/-level
+// helpers.
+
+// TestAcquireAutoscalerLease_Disabled_ReturnsNoopRelease pins the
+// AUTOSCALER_SINGLETON_ENABLED=false branch: a no-op release is returned
+// (caller defers unconditionally) and no real lease is touched.
+func TestAcquireAutoscalerLease_Disabled_ReturnsNoopRelease(t *testing.T) {
+	t.Setenv("AUTOSCALER_SINGLETON_ENABLED", "false")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	st := newTestOmniState()
+	stop := func() { /* unused */ }
+
+	release, err := acquireAutoscalerLease(ctx, ctx, zaptest.NewLogger(t), st, "test-cluster", stop)
+	require.NoError(t, err)
+	require.NotNil(t, release, "release must be non-nil (caller defers unconditionally)")
+	assert.NotPanics(t, release)
+}
+
+// TestAcquireProviderLease_Disabled_ReturnsNilRelease pins the
+// PROVIDER_SINGLETON_ENABLED=false branch on the provider main.
+// The corresponding ctx-cancelled-mid-Acquire branch is covered by
+// the end-to-end TestRunAutoscaler_ShutsDownCleanlyOnContextCancel —
+// the in-memory state stub doesn't honor ctx cancellation, so direct
+// unit-testing of that branch requires a state mock; deferred until a
+// future test that needs a generic state stub.
+func TestAcquireProviderLease_Disabled_ReturnsNilRelease(t *testing.T) {
+	t.Setenv("PROVIDER_SINGLETON_ENABLED", "false")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	st := newTestOmniState()
+
+	release, err := acquireProviderLease(ctx, cancel, st, zaptest.NewLogger(t))
+	require.NoError(t, err)
+	assert.Nil(t, release, "release must be nil when lease is disabled (caller skips defer)")
+}
+
+// TestErrAutoscalerLeaseShutdownDuringAcquire pins the sentinel's
+// identity: the caller (runAutoscaler) uses errors.Is on it to decide
+// whether to exit 0 (clean shutdown) or surface the error.
+func TestErrAutoscalerLeaseShutdownDuringAcquire_IsDistinguishable(t *testing.T) {
+	require.NotNil(t, errAutoscalerLeaseShutdownDuringAcquire)
+	assert.True(t, errors.Is(errAutoscalerLeaseShutdownDuringAcquire, errAutoscalerLeaseShutdownDuringAcquire))
+	// Must NOT collide with other sentinel errors the caller might
+	// distinguish in the future.
+	assert.False(t, errors.Is(errAutoscalerLeaseShutdownDuringAcquire, context.Canceled),
+		"sentinel must NOT be context.Canceled — that would conflate clean shutdown with cancellation")
 }

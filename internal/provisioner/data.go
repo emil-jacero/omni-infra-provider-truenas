@@ -269,191 +269,207 @@ const (
 // on a single VM.
 const MaxAdditionalNICs = 16
 
-// Validate checks the Data config for logical errors.
+// Validate checks the Data config for logical errors. The body is split
+// into focused validators (resources / disks / names / NICs) so a future
+// field addition only touches the relevant helper, and so each branch of
+// the cognitive-complexity budget stays under 15.
 func (d *Data) Validate() error {
+	if err := d.validateCPU(); err != nil {
+		return err
+	}
+	if err := d.validateMemory(); err != nil {
+		return err
+	}
+	if err := d.validateRootAndStorageDisk(); err != nil {
+		return err
+	}
+	if err := validateExtensions(d.Extensions); err != nil {
+		return err
+	}
+	if err := d.validatePathNames(); err != nil {
+		return err
+	}
+	if err := d.validateAdditionalDisks(); err != nil {
+		return err
+	}
+	return d.validateAdditionalNICs()
+}
+
+func (d *Data) validateCPU() error {
 	if d.CPUs < 0 {
 		return fmt.Errorf("cpus must be >= 0, got %d", d.CPUs)
 	}
-
 	if d.CPUs > MaxCPUs {
 		return fmt.Errorf("cpus must be <= %d, got %d", MaxCPUs, d.CPUs)
 	}
+	return nil
+}
 
+func (d *Data) validateMemory() error {
 	if d.Memory < 0 {
 		return fmt.Errorf("memory must be >= 0, got %d", d.Memory)
 	}
-
 	if d.Memory != 0 && d.Memory < MinMemoryMiB {
 		return fmt.Errorf("memory must be >= %d MiB when set, got %d", MinMemoryMiB, d.Memory)
 	}
-
 	if d.Memory > MaxMemoryMiB {
 		return fmt.Errorf("memory must be <= %d MiB, got %d", MaxMemoryMiB, d.Memory)
 	}
 
-	// `min_memory` is the soft floor for memory ballooning. When unset (0)
-	// it's omitted from the vm.create payload and TrueNAS treats `memory`
-	// as a hard reservation. When set, it must be at least the
-	// MinMemoryMiB floor (anything smaller can't run a Talos kernel) and
-	// at most the configured `memory` ceiling — TrueNAS rejects
-	// min_memory > memory at vm.create time, but catching it here gives a
-	// MachineClass-level error that points at the field, not a libvirt
-	// stack trace four steps later.
+	// `min_memory` is the soft floor for memory ballooning. See
+	// docs/sizing.md. TrueNAS rejects min_memory > memory at vm.create
+	// time, but catching it here points at the MachineClass field rather
+	// than handing the operator a libvirt stack trace four steps later.
 	if d.MinMemory < 0 {
 		return fmt.Errorf("min_memory must be >= 0, got %d", d.MinMemory)
 	}
-
 	if d.MinMemory != 0 && d.MinMemory < MinMemoryMiB {
 		return fmt.Errorf("min_memory must be >= %d MiB when set, got %d", MinMemoryMiB, d.MinMemory)
 	}
-
 	if d.MinMemory > d.Memory {
 		return fmt.Errorf("min_memory (%d MiB) must be <= memory (%d MiB). min_memory is the soft floor (reserved at vm.start); memory is the ceiling the guest can balloon up to. To fix: either RAISE memory to >= %d in the MachineClass (current ceiling too low for the requested floor), or LOWER min_memory to <= %d (current floor too high for the requested ceiling). Typical workers: memory=8192, min_memory=2048. Typical control planes: memory=4096, min_memory=2048",
 			d.MinMemory, d.Memory, d.MinMemory, d.Memory)
 	}
+	return nil
+}
 
+func (d *Data) validateRootAndStorageDisk() error {
 	if d.DiskSize < 0 {
 		return fmt.Errorf("disk_size must be >= 0, got %d", d.DiskSize)
 	}
-
-	// The OS / system disk floor is deliberately higher than the
-	// additional-disk floor: a Talos control-plane node pulls
-	// kube-apiserver, etcd, scheduler, controller-manager, CNI, and
-	// CoreDNS during bootstrap. Undersized root disks trigger the
-	// kubelet's image GC loop mid-install and etcd never comes up.
-	// See MinRootDiskSizeGiB's docstring for the incident history.
 	if d.DiskSize != 0 && d.DiskSize < MinRootDiskSizeGiB {
 		return fmt.Errorf("disk_size must be >= %d GiB — control-plane nodes need room for the Talos image plus kube-* and etcd image pulls during bootstrap (got %d)", MinRootDiskSizeGiB, d.DiskSize)
 	}
-
 	if d.DiskSize > MaxDiskSizeGiB {
 		return fmt.Errorf("disk_size must be <= %d GiB, got %d", MaxDiskSizeGiB, d.DiskSize)
 	}
-
 	if d.StorageDiskSize < 0 {
 		return fmt.Errorf("storage_disk_size must be >= 0, got %d", d.StorageDiskSize)
 	}
-
 	if d.StorageDiskSize > 0 && d.StorageDiskSize < MinDiskSizeGiB {
 		return fmt.Errorf("storage_disk_size must be >= %d GiB when set, got %d", MinDiskSizeGiB, d.StorageDiskSize)
 	}
-
 	if d.StorageDiskSize > MaxDiskSizeGiB {
 		return fmt.Errorf("storage_disk_size must be <= %d GiB, got %d", MaxDiskSizeGiB, d.StorageDiskSize)
 	}
+	return nil
+}
 
-	if err := validateExtensions(d.Extensions); err != nil {
-		return err
-	}
-
-	// Validate names used in filesystem paths to prevent path traversal
+func (d *Data) validatePathNames() error {
 	if err := validateSafeName("pool", d.Pool); err != nil {
 		return err
 	}
-
 	if err := validateSafeName("network_interface", d.NetworkInterface); err != nil {
 		return err
 	}
+	return validateDatasetPrefixSegments("dataset_prefix", d.DatasetPrefix, true)
+}
 
-	// Validate each segment of dataset_prefix individually (slashes are path separators, not part of names)
-	if d.DatasetPrefix != "" {
-		segments := strings.Split(d.DatasetPrefix, "/")
-		for i, seg := range segments {
-			if seg == "" {
-				return fmt.Errorf("dataset_prefix has empty segment at position %d — use 'a/b' not 'a//b' or '/a/b'", i)
+// validateDatasetPrefixSegments splits prefix on '/' and validates each
+// segment via validateSafeName. When rejectEmptySegments is true (the
+// MachineClass-root form), an empty segment is an error pointing at the
+// position. When false (the per-additional-disk form), empty segments are
+// silently skipped — additional disks may inherit a parent prefix with a
+// trailing slash from operator-typed config and the historical behavior
+// was lenient on this. Centralizing both rules here makes the divergence
+// explicit and easy to converge in the future.
+func validateDatasetPrefixSegments(fieldLabel, prefix string, rejectEmptySegments bool) error {
+	if prefix == "" {
+		return nil
+	}
+	for i, seg := range strings.Split(prefix, "/") {
+		if seg == "" {
+			if rejectEmptySegments {
+				return fmt.Errorf("%s has empty segment at position %d — use 'a/b' not 'a//b' or '/a/b'", fieldLabel, i)
 			}
-
-			if err := validateSafeName(fmt.Sprintf("dataset_prefix segment %d (%q)", i, seg), seg); err != nil {
-				return err
-			}
+			continue
+		}
+		if err := validateSafeName(fmt.Sprintf("%s segment %d (%q)", fieldLabel, i, seg), seg); err != nil {
+			return err
 		}
 	}
+	return nil
+}
 
+func (d *Data) validateAdditionalDisks() error {
 	if len(d.AdditionalDisks) > 16 {
 		return fmt.Errorf("additional_disks: maximum 16 additional disks allowed, got %d", len(d.AdditionalDisks))
 	}
 
-	seenVolumeNames := make(map[string]int)
-
+	seenVolumeNames := make(map[string]int, len(d.AdditionalDisks))
 	for i, disk := range d.AdditionalDisks {
-		if disk.Size < MinDiskSizeGiB {
-			return fmt.Errorf("additional_disks[%d]: size must be >= %d GiB, got %d", i, MinDiskSizeGiB, disk.Size)
-		}
-
-		if disk.Size > MaxDiskSizeGiB {
-			return fmt.Errorf("additional_disks[%d]: size must be <= %d GiB, got %d", i, MaxDiskSizeGiB, disk.Size)
-		}
-
-		if disk.Pool != "" {
-			if err := validateSafeName(fmt.Sprintf("additional_disks[%d].pool", i), disk.Pool); err != nil {
-				return err
-			}
-		}
-
-		if disk.DatasetPrefix != "" {
-			for j, seg := range strings.Split(disk.DatasetPrefix, "/") {
-				if seg == "" {
-					continue
-				}
-
-				if err := validateSafeName(fmt.Sprintf("additional_disks[%d].dataset_prefix segment %d (%q)", i, j, seg), seg); err != nil {
-					return err
-				}
-			}
-		}
-
-		if disk.Name != "" {
-			if err := validateSafeName(fmt.Sprintf("additional_disks[%d].name", i), disk.Name); err != nil {
-				return err
-			}
-
-			if prev, dup := seenVolumeNames[disk.Name]; dup {
-				return fmt.Errorf("additional_disks[%d].name %q collides with additional_disks[%d].name — each volume name must be unique because it becomes the mount path at /var/mnt/<name>", i, disk.Name, prev)
-			}
-
-			seenVolumeNames[disk.Name] = i
-		}
-
-		if disk.Filesystem != "" && disk.Filesystem != "xfs" && disk.Filesystem != "ext4" {
-			return fmt.Errorf("additional_disks[%d].filesystem must be \"xfs\" or \"ext4\", got %q", i, disk.Filesystem)
+		if err := validateOneAdditionalDisk(i, disk, seenVolumeNames); err != nil {
+			return err
 		}
 	}
+	return nil
+}
 
+func validateOneAdditionalDisk(i int, disk AdditionalDisk, seenVolumeNames map[string]int) error {
+	if disk.Size < MinDiskSizeGiB {
+		return fmt.Errorf("additional_disks[%d]: size must be >= %d GiB, got %d", i, MinDiskSizeGiB, disk.Size)
+	}
+	if disk.Size > MaxDiskSizeGiB {
+		return fmt.Errorf("additional_disks[%d]: size must be <= %d GiB, got %d", i, MaxDiskSizeGiB, disk.Size)
+	}
+	if disk.Pool != "" {
+		if err := validateSafeName(fmt.Sprintf("additional_disks[%d].pool", i), disk.Pool); err != nil {
+			return err
+		}
+	}
+	if err := validateDatasetPrefixSegments(fmt.Sprintf("additional_disks[%d].dataset_prefix", i), disk.DatasetPrefix, false); err != nil {
+		return err
+	}
+	if disk.Name != "" {
+		if err := validateSafeName(fmt.Sprintf("additional_disks[%d].name", i), disk.Name); err != nil {
+			return err
+		}
+		if prev, dup := seenVolumeNames[disk.Name]; dup {
+			return fmt.Errorf("additional_disks[%d].name %q collides with additional_disks[%d].name — each volume name must be unique because it becomes the mount path at /var/mnt/<name>", i, disk.Name, prev)
+		}
+		seenVolumeNames[disk.Name] = i
+	}
+	if disk.Filesystem != "" && disk.Filesystem != "xfs" && disk.Filesystem != "ext4" {
+		return fmt.Errorf("additional_disks[%d].filesystem must be \"xfs\" or \"ext4\", got %q", i, disk.Filesystem)
+	}
+	return nil
+}
+
+func (d *Data) validateAdditionalNICs() error {
 	if len(d.AdditionalNICs) > MaxAdditionalNICs {
 		return fmt.Errorf("additional_nics: at most %d NICs supported (got %d) — caps prevent operator-input DoS on the ConfigPatchRequest resource size", MaxAdditionalNICs, len(d.AdditionalNICs))
 	}
 
-	seen := make(map[string]bool)
-
-	// Primary NIC is always in the "seen" set
+	seen := make(map[string]bool, len(d.AdditionalNICs)+1)
 	if d.NetworkInterface != "" {
 		seen[d.NetworkInterface] = true
 	}
 
 	for i, nic := range d.AdditionalNICs {
-		if nic.NetworkInterface == "" {
-			return fmt.Errorf("additional_nics[%d]: network_interface is required", i)
-		}
-
-		if err := validateSafeName(fmt.Sprintf("additional_nics[%d].network_interface", i), nic.NetworkInterface); err != nil {
+		if err := validateOneAdditionalNIC(i, nic, seen); err != nil {
 			return err
 		}
-
-		if seen[nic.NetworkInterface] {
-			return fmt.Errorf("additional_nics[%d]: duplicate network_interface %q — each NIC must use a different interface", i, nic.NetworkInterface)
-		}
-
-		seen[nic.NetworkInterface] = true
-
-		if nic.Type != "" && nic.Type != "VIRTIO" && nic.Type != "E1000" {
-			return fmt.Errorf("additional_nics[%d]: type must be VIRTIO or E1000, got %q", i, nic.Type)
-		}
-
-		if nic.MTU != 0 && (nic.MTU < 576 || nic.MTU > 9216) {
-			return fmt.Errorf("additional_nics[%d]: mtu must be between 576 and 9216, got %d", i, nic.MTU)
-		}
-
 	}
+	return nil
+}
 
+func validateOneAdditionalNIC(i int, nic AdditionalNIC, seen map[string]bool) error {
+	if nic.NetworkInterface == "" {
+		return fmt.Errorf("additional_nics[%d]: network_interface is required", i)
+	}
+	if err := validateSafeName(fmt.Sprintf("additional_nics[%d].network_interface", i), nic.NetworkInterface); err != nil {
+		return err
+	}
+	if seen[nic.NetworkInterface] {
+		return fmt.Errorf("additional_nics[%d]: duplicate network_interface %q — each NIC must use a different interface", i, nic.NetworkInterface)
+	}
+	seen[nic.NetworkInterface] = true
+
+	if nic.Type != "" && nic.Type != "VIRTIO" && nic.Type != "E1000" {
+		return fmt.Errorf("additional_nics[%d]: type must be VIRTIO or E1000, got %q", i, nic.Type)
+	}
+	if nic.MTU != 0 && (nic.MTU < 576 || nic.MTU > 9216) {
+		return fmt.Errorf("additional_nics[%d]: mtu must be between 576 and 9216, got %d", i, nic.MTU)
+	}
 	return nil
 }

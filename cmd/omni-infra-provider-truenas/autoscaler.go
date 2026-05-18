@@ -9,14 +9,18 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cosi-project/runtime/pkg/state"
 	"github.com/siderolabs/omni/client/pkg/client"
 	"github.com/siderolabs/omni/client/pkg/client/omni"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 	"go.uber.org/zap"
 
 	"github.com/bearbinary/omni-infra-provider-truenas/internal/autoscaler"
 	truenasclient "github.com/bearbinary/omni-infra-provider-truenas/internal/client"
 	"github.com/bearbinary/omni-infra-provider-truenas/internal/resources/meta"
 	"github.com/bearbinary/omni-infra-provider-truenas/internal/singleton"
+	"github.com/bearbinary/omni-infra-provider-truenas/internal/telemetry"
 )
 
 // runAutoscaler is the entry point for the `omni-infra-provider-truenas
@@ -72,106 +76,28 @@ func runAutoscaler(baseCtx context.Context) error {
 
 	omniState := omniClient.Omni().State()
 
-	// Build TrueNAS client for the capacity gate. Reuses the same env
-	// vars the provisioner's main.go consumes — matches operator
-	// expectations and avoids documentation drift.
-	//
-	// Host is optional: when unset, the capacity gate is disabled
-	// (CapacityQuery passed as nil to the Server). That mode is
-	// useful for dry-run deploys where the operator wants to observe
-	// NodeGroups discovery + write-path-idempotency without risking
-	// gate misconfiguration blocking everything.
-	var (
-		gate        autoscaler.CapacityQuery
-		tnClient    *truenasclient.Client
-		defaultPool string
-	)
-
-	truenasHost := os.Getenv("TRUENAS_HOST")
-	if truenasHost != "" {
-		tnClient, err = truenasclient.New(truenasclient.Config{
-			Host:               truenasHost,
-			APIKey:             consumeSecretEnv("TRUENAS_API_KEY"),
-			InsecureSkipVerify: envBool("TRUENAS_INSECURE_SKIP_VERIFY", false),
-			MaxConcurrentCalls: envInt("TRUENAS_MAX_CONCURRENT_CALLS", 4),
-		})
-		if err != nil {
-			return fmt.Errorf("autoscaler: build TrueNAS client: %w", err)
-		}
-
-		defer func() { _ = tnClient.Close() }()
-
-		gate = autoscaler.NewTrueNASCapacityAdapter(tnClient)
-		defaultPool = envString("DEFAULT_POOL", "default")
-
-		logger.Info("autoscaler: TrueNAS capacity gate enabled",
-			zap.String("default_pool", defaultPool),
-		)
-	} else {
-		logger.Warn("autoscaler: TRUENAS_HOST unset — capacity gate disabled; scale-up decisions will proceed without pool/host-memory checks")
+	bundle, err := buildAutoscalerCapacityGate(logger)
+	if err != nil {
+		return err
 	}
+	defer bundle.Close()
 
 	discoverer := autoscaler.NewDiscoverer(omniState, cfg.ClusterName, logger)
 	writer := autoscaler.NewScaleWriter(omniState)
 
-	server := autoscaler.NewServer(logger, cfg, gate, discoverer, writer).WithDefaultPool(defaultPool)
+	server := autoscaler.NewServer(logger, cfg, bundle.Query, discoverer, writer).WithDefaultPool(bundle.DefaultPool)
 
 	ctx, stop := signal.NotifyContext(baseCtx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Singleton lease prevents two autoscaler Deployments (e.g.,
-	// during a rolling restart or a misconfigured HA deploy) from
-	// concurrently writing MachineAllocation.MachineCount on the
-	// same cluster. Omni's UpdateWithConflicts already makes
-	// concurrent writes *correct* (one wins, the other retries), but
-	// the lease prevents duplicate API traffic + duplicate structured
-	// logs that would otherwise confuse operators reading pod logs.
-	//
-	// Namespaced ProviderID ("autoscaler-<cluster>") so the lease
-	// doesn't collide with the provisioner's provider-id lease. Two
-	// autoscalers managing different clusters can coexist; two
-	// autoscalers managing the same cluster block on this lease.
-	//
-	// Disabled when AUTOSCALER_SINGLETON_ENABLED=false — useful for
-	// operators deploying `replicas: 0`-style dry-runs where the
-	// lease would block a manual test run.
-	if envBool("AUTOSCALER_SINGLETON_ENABLED", true) {
-		leaseID := "autoscaler-" + cfg.ClusterName
-
-		lease, leaseErr := singleton.New(omniState, singleton.Config{
-			ProviderID:      leaseID,
-			RefreshInterval: envDuration("AUTOSCALER_SINGLETON_REFRESH_INTERVAL", singleton.DefaultRefreshInterval),
-			StaleAfter:      envDuration("AUTOSCALER_SINGLETON_STALE_AFTER", 45*time.Second),
-		}, logger)
-		if leaseErr != nil {
-			return fmt.Errorf("construct autoscaler singleton lease: %w", leaseErr)
-		}
-
-		if acquireErr := lease.Acquire(ctx); acquireErr != nil {
-			// A context-cancellation during Acquire means the process
-			// is already shutting down before the lease was even
-			// probed — don't treat that as an error path.
-			if errors.Is(acquireErr, context.Canceled) {
-				logger.Info("autoscaler shutting down before lease acquired")
-				return nil
-			}
-
-			return fmt.Errorf("acquire autoscaler singleton lease for %q: %w", leaseID, acquireErr)
-		}
-
-		defer lease.Release(context.Background())
-
-		go func() {
-			if err := lease.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-				logger.Error("autoscaler singleton lease lost", zap.Error(err))
-				stop()
-			}
-		}()
-
-		logger.Info("autoscaler singleton lease acquired", zap.String("lease_id", leaseID))
-	} else {
-		logger.Warn("autoscaler singleton lease DISABLED — concurrent Deployments can race on MachineAllocation writes (UpdateWithConflicts still prevents incorrect state, but expect duplicate log/metric traffic)")
+	release, err := acquireAutoscalerLease(ctx, baseCtx, logger, omniState, cfg.ClusterName, stop)
+	if errors.Is(err, errAutoscalerLeaseShutdownDuringAcquire) {
+		return nil
 	}
+	if err != nil {
+		return err
+	}
+	defer release()
 
 	if err := server.Listen(ctx); err != nil {
 		if errors.Is(err, context.Canceled) {
@@ -185,6 +111,132 @@ func runAutoscaler(baseCtx context.Context) error {
 	logger.Info("autoscaler shutting down")
 
 	return nil
+}
+
+// CapacityGateBundle wraps the autoscaler's optional TrueNAS capacity gate
+// + its TrueNAS client + the default pool, with a single Close() that
+// safely no-ops when the gate is disabled. The caller defers bundle.Close()
+// unconditionally — no nil-check dance.
+type CapacityGateBundle struct {
+	Query       autoscaler.CapacityQuery
+	DefaultPool string
+	close       func()
+}
+
+// Close releases the underlying TrueNAS client, or no-ops if the gate was
+// disabled via unset TRUENAS_HOST.
+func (b *CapacityGateBundle) Close() {
+	if b == nil || b.close == nil {
+		return
+	}
+	b.close()
+}
+
+// buildAutoscalerCapacityGate constructs the capacity-gate bundle. When
+// TRUENAS_HOST is unset (dry-run mode), returns a bundle with a nil Query
+// and a no-op Close — the caller never has to check for nil.
+func buildAutoscalerCapacityGate(logger *zap.Logger) (*CapacityGateBundle, error) {
+	truenasHost := os.Getenv("TRUENAS_HOST")
+	if truenasHost == "" {
+		logger.Warn("autoscaler: TRUENAS_HOST unset — capacity gate disabled; scale-up decisions will proceed without pool/host-memory checks")
+		return &CapacityGateBundle{}, nil
+	}
+
+	tnClient, err := truenasclient.New(truenasclient.Config{
+		Host:               truenasHost,
+		APIKey:             consumeSecretEnv("TRUENAS_API_KEY"),
+		InsecureSkipVerify: envBool("TRUENAS_INSECURE_SKIP_VERIFY", false),
+		MaxConcurrentCalls: envInt("TRUENAS_MAX_CONCURRENT_CALLS", 4),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("autoscaler: build TrueNAS client: %w", err)
+	}
+
+	defaultPool := envString("DEFAULT_POOL", "default")
+	logger.Info("autoscaler: TrueNAS capacity gate enabled", zap.String("default_pool", defaultPool))
+
+	return &CapacityGateBundle{
+		Query:       autoscaler.NewTrueNASCapacityAdapter(tnClient),
+		DefaultPool: defaultPool,
+		close:       func() { _ = tnClient.Close() },
+	}, nil
+}
+
+// errAutoscalerLeaseShutdownDuringAcquire is returned when ctx is cancelled
+// before lease.Acquire completes. The caller treats this as a clean exit
+// (the process is already shutting down) — distinguished from real
+// acquire failures via errors.Is.
+var errAutoscalerLeaseShutdownDuringAcquire = errors.New("autoscaler shutting down before lease acquired")
+
+// acquireAutoscalerLease constructs and acquires the singleton lease for
+// the autoscaler subcommand. Returns one of:
+//
+//   - (no-op release, nil)                              — lease disabled via env; run anyway.
+//   - (release fn, nil)                                 — acquired; caller defers release.
+//   - (nil, errAutoscalerLeaseShutdownDuringAcquire)    — ctx cancelled mid-acquire; bail clean.
+//   - (nil, real err)                                   — construction/acquire failed hard.
+//
+// The returned release is always non-nil when err is nil — the caller can
+// `defer release()` unconditionally.
+func acquireAutoscalerLease(ctx, baseCtx context.Context, logger *zap.Logger, omniState state.State, clusterName string, stop context.CancelFunc) (release func(), err error) {
+	noop := func() {}
+	if !envBool("AUTOSCALER_SINGLETON_ENABLED", true) {
+		logger.Warn("autoscaler singleton lease DISABLED — concurrent Deployments can race on MachineAllocation writes (UpdateWithConflicts still prevents incorrect state, but expect duplicate log/metric traffic)")
+		return noop, nil
+	}
+
+	leaseID := "autoscaler-" + clusterName
+
+	lease, leaseErr := singleton.New(omniState, singleton.Config{
+		ProviderID:      leaseID,
+		RefreshInterval: envDuration("AUTOSCALER_SINGLETON_REFRESH_INTERVAL", singleton.DefaultRefreshInterval),
+		StaleAfter:      envDuration("AUTOSCALER_SINGLETON_STALE_AFTER", 45*time.Second),
+	}, logger)
+	if leaseErr != nil {
+		return nil, fmt.Errorf("construct autoscaler singleton lease: %w", leaseErr)
+	}
+
+	if acquireErr := lease.Acquire(ctx); acquireErr != nil {
+		if errors.Is(acquireErr, context.Canceled) {
+			logger.Info("autoscaler shutting down before lease acquired")
+			return nil, errAutoscalerLeaseShutdownDuringAcquire
+		}
+
+		return nil, fmt.Errorf("acquire autoscaler singleton lease for %q: %w", leaseID, acquireErr)
+	}
+
+	// Item 4 (Obs): release runs through a 5s timeout so a slow Omni RPC
+	// cannot stall pod shutdown. WithoutCancel preserves trace IDs through
+	// the cleanup span.
+	release = func() {
+		relCtx, relCancel := context.WithTimeout(context.WithoutCancel(baseCtx), 5*time.Second)
+		defer relCancel()
+		lease.Release(relCtx)
+		if telemetry.SingletonLeaseHeld != nil {
+			telemetry.SingletonLeaseHeld.Record(relCtx, 0, metric.WithAttributes(attribute.String("scope", leaseID)))
+		}
+	}
+
+	// Item 5 (Obs): emit the SingletonLeaseHeld gauge on acquire + decrement
+	// on lease-lost + release. Provider-side already does this; autoscaler
+	// was missing.
+	if telemetry.SingletonLeaseHeld != nil {
+		telemetry.SingletonLeaseHeld.Record(ctx, 1, metric.WithAttributes(attribute.String("scope", leaseID)))
+	}
+
+	go func() {
+		if runErr := lease.Run(ctx); runErr != nil && !errors.Is(runErr, context.Canceled) {
+			logger.Error("autoscaler singleton lease lost", zap.Error(runErr))
+			if telemetry.SingletonLeaseHeld != nil {
+				telemetry.SingletonLeaseHeld.Record(ctx, 0, metric.WithAttributes(attribute.String("scope", leaseID)))
+			}
+			stop()
+		}
+	}()
+
+	logger.Info("autoscaler singleton lease acquired", zap.String("lease_id", leaseID))
+
+	return release, nil
 }
 
 // newOmniClient constructs an Omni SDK client from the same env vars

@@ -10,6 +10,7 @@ import (
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
 	"github.com/bearbinary/omni-infra-provider-truenas/internal/client"
@@ -255,75 +256,67 @@ func (cl *Cleaner) cleanupOrphanVMs(ctx context.Context, managedZvols []client.M
 	}
 
 	for _, vm := range vms {
-		if !meta.IsOmniVMName(vm.Name) {
-			continue
-		}
+		cl.maybeDeleteOrphanVM(ctx, vm, managedRequestIDs, liveRequests, span)
+	}
+}
 
-		// Authoritative source for request-id is the VM description written
-		// at create time by `omniVMDescription`. Name-based derivation (which
-		// this code used pre-v0.15.3) silently miscomputes the id on v0.15+
-		// VMs because it leaves the `<providerID>_` namespacing segment in
-		// place — e.g., `omni_truenas_talos_preview_cp_abc` was derived as
-		// `truenas-talos-preview-cp-abc` which never matched any real zvol's
-		// `org.omni:request-id`, so EVERY v0.15+ VM was mis-flagged as an
-		// orphan and deleted on the next cleanup cycle. Observed in prod
-		// post-v0.15.0: 7+ freshly-created cluster members killed by the
-		// orphan sweep minutes after provision finished.
-		requestID := meta.ParseRequestIDFromDescription(vm.Description)
-		if requestID == "" {
-			// Either a legacy v0.14 VM whose description was the bare prefix
-			// with no `(request-id: …)` suffix, or a look-alike that happens
-			// to start with `omni_` but isn't ours. Neither is safe to delete
-			// from this path — skip and leave for manual operator cleanup.
-			cl.logger.Debug("skipping VM without request-id in description",
-				zap.String("name", vm.Name),
-				zap.Int("id", vm.ID),
-			)
+// maybeDeleteOrphanVM evaluates a single VM against the orphan-detection
+// rules and removes it when both signals confirm orphan status. Lifted out
+// of cleanupOrphanVMs so the outer loop is a flat iteration — the rule
+// logic is the part with all the branches.
+func (cl *Cleaner) maybeDeleteOrphanVM(ctx context.Context, vm client.VM, managedRequestIDs, liveRequests map[string]bool, span trace.Span) {
+	if !meta.IsOmniVMName(vm.Name) {
+		return
+	}
 
-			continue
-		}
-
-		// Two orphan signals (see function godoc):
-		//   reason="no_machine_request" — live cross-reference says
-		//     Omni doesn't know about this request-id at all. Highest
-		//     confidence; available only when liveRequests is non-nil.
-		//   reason="backing_zvol_missing" — partial deprovision; the
-		//     zvol was deleted but the VM wasn't. Always evaluated.
-		// Both reasons are sufficient on their own. We pick the
-		// higher-confidence reason for the log line so on-call can tell
-		// whether the orphan came from an Omni-side delete (drift /
-		// manual cleanup) or a TrueNAS-side teardown failure (provider
-		// bug / API hiccup).
-		var reason string
-
-		switch {
-		case liveRequests != nil && !liveRequests[requestID]:
-			reason = "no_machine_request"
-		case !managedRequestIDs[requestID]:
-			reason = "backing_zvol_missing"
-		default:
-			// Both checks pass: VM has a MachineRequest in Omni AND
-			// a backing zvol on TrueNAS. Legitimate; skip.
-			continue
-		}
-
-		cl.logger.Info("removing orphan VM",
+	// Authoritative source for request-id is the VM description written at
+	// create time by `omniVMDescription`. Name-based derivation (used pre-
+	// v0.15.3) silently miscomputed the id on v0.15+ VMs because it left
+	// the `<providerID>_` namespacing segment in place — observed in prod
+	// post-v0.15.0: 7+ freshly-created cluster members killed by the
+	// orphan sweep minutes after provision finished.
+	requestID := meta.ParseRequestIDFromDescription(vm.Description)
+	if requestID == "" {
+		// Legacy v0.14 VM or look-alike; not safe to delete from this path.
+		cl.logger.Debug("skipping VM without request-id in description",
 			zap.String("name", vm.Name),
 			zap.Int("id", vm.ID),
-			zap.String("request_id", requestID),
-			zap.String("reason", reason),
 		)
 
-		if err := cl.client.StopVM(ctx, vm.ID, true); err != nil && !client.IsNotFound(err) {
-			cl.logger.Warn("failed to stop orphan VM", zap.Int("id", vm.ID), zap.Error(err))
-		}
+		return
+	}
 
-		if err := cl.client.DeleteVM(ctx, vm.ID); err != nil {
-			cl.logger.Warn("failed to delete orphan VM", zap.Int("id", vm.ID), zap.Error(err))
-			span.RecordError(err)
-		} else if telemetry.CleanupOrphanVMs != nil {
-			telemetry.CleanupOrphanVMs.Add(ctx, 1)
-		}
+	// Two orphan signals (see cleanupOrphanVMs godoc):
+	//   reason="no_machine_request"   — live cross-reference disagreement
+	//   reason="backing_zvol_missing" — partial deprovision left a VM behind
+	var reason string
+
+	switch {
+	case liveRequests != nil && !liveRequests[requestID]:
+		reason = "no_machine_request"
+	case !managedRequestIDs[requestID]:
+		reason = "backing_zvol_missing"
+	default:
+		return
+	}
+
+	cl.logger.Info("removing orphan VM",
+		zap.String("name", vm.Name),
+		zap.Int("id", vm.ID),
+		zap.String("request_id", requestID),
+		zap.String("reason", reason),
+	)
+
+	if err := cl.client.StopVM(ctx, vm.ID, true); err != nil && !client.IsNotFound(err) {
+		cl.logger.Warn("failed to stop orphan VM", zap.Int("id", vm.ID), zap.Error(err))
+		span.RecordError(err)
+	}
+
+	if err := cl.client.DeleteVM(ctx, vm.ID); err != nil {
+		cl.logger.Warn("failed to delete orphan VM", zap.Int("id", vm.ID), zap.Error(err))
+		span.RecordError(err)
+	} else if telemetry.CleanupOrphanVMs != nil {
+		telemetry.CleanupOrphanVMs.Add(ctx, 1)
 	}
 }
 

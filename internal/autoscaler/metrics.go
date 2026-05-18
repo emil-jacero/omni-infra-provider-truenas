@@ -2,6 +2,7 @@ package autoscaler
 
 import (
 	"context"
+	"strings"
 	"sync"
 
 	"go.opentelemetry.io/otel"
@@ -158,45 +159,15 @@ func categorizeDenialReason(reason string) string {
 }
 
 // contains is a case-insensitive substring check used by
-// categorizeDenialReason. Kept private to this file because it's a
-// one-off — the stdlib strings.Contains is case-sensitive, which
-// bites when a future gate rephrasing capitalizes "Host" or
+// categorizeDenialReason. The stdlib strings.Contains is case-sensitive,
+// which bites when a future gate rephrasing capitalizes "Host" or
 // "Query".
+//
+// Performance note: each call allocates two new strings via ToLower. This
+// is acceptable here — categorizeDenialReason runs once per *denied*
+// scale-up RPC, which is a cold path. Do not copy this pattern into hot
+// code; for hot paths prefer strings.EqualFold (full-string compare) or
+// pre-lowered needle constants with a single ToLower on the haystack.
 func contains(haystack, needle string) bool {
-	if len(needle) == 0 {
-		return true
-	}
-
-	if len(haystack) < len(needle) {
-		return false
-	}
-
-	for i := 0; i+len(needle) <= len(haystack); i++ {
-		match := true
-
-		for j := 0; j < len(needle); j++ {
-			h := haystack[i+j]
-			n := needle[j]
-
-			if h >= 'A' && h <= 'Z' {
-				h += 'a' - 'A'
-			}
-
-			if n >= 'A' && n <= 'Z' {
-				n += 'a' - 'A'
-			}
-
-			if h != n {
-				match = false
-
-				break
-			}
-		}
-
-		if match {
-			return true
-		}
-	}
-
-	return false
+	return strings.Contains(strings.ToLower(haystack), strings.ToLower(needle))
 }

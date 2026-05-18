@@ -11,6 +11,11 @@ edit_uri: edit/main/docs/
 
 copyright: Copyright &copy; 2024-2026 Bear Binary — MIT License
 
+# Marketing workspace lives under docs/content/ for version control + colocation
+# with the project. It is NOT part of the public documentation site.
+exclude_docs: |
+  content/
+
 theme:
   name: material
   logo: assets/logo.png

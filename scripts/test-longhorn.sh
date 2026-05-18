@@ -18,16 +18,20 @@ NC='\033[0m'
 PASS=0
 FAIL=0
 NAMESPACE="longhorn-test"
+readonly PHASE_SUCCEEDED="Succeeded"
+readonly JSONPATH_PHASE='{.status.phase}'
+readonly HR_BANNER="========================================="
 
-log()  { echo -e "${GREEN}[PASS]${NC} $1"; ((PASS++)); }
-fail() { echo -e "${RED}[FAIL]${NC} $1"; ((FAIL++)); }
-info() { echo -e "${YELLOW}[INFO]${NC} $1"; }
+log()  { local msg="$1"; echo -e "${GREEN}[PASS]${NC} ${msg}"; PASS=$((PASS+1)); return 0; }
+fail() { local msg="$1"; echo -e "${RED}[FAIL]${NC} ${msg}"; FAIL=$((FAIL+1)); return 0; }
+info() { local msg="$1"; echo -e "${YELLOW}[INFO]${NC} ${msg}"; return 0; }
 
 cleanup() {
     info "Cleaning up test resources..."
     kubectl delete namespace "$NAMESPACE" --ignore-not-found --grace-period=0 --force 2>/dev/null || true
     kubectl delete pvc longhorn-test-pvc default-sc-test --ignore-not-found 2>/dev/null || true
     info "Cleanup complete"
+    return 0
 }
 
 if [[ "${1:-}" == "--cleanup-only" ]]; then
@@ -37,9 +41,9 @@ fi
 
 trap cleanup EXIT
 
-echo "========================================="
+echo "${HR_BANNER}"
 echo " Longhorn Storage Validation Test Suite"
-echo "========================================="
+echo "${HR_BANNER}"
 echo ""
 
 # ─── Test 1: Longhorn StorageClass exists and is NOT default ───
@@ -113,7 +117,7 @@ spec:
 EOF
 
 for i in $(seq 1 60); do
-    PVC_STATUS=$(kubectl get pvc longhorn-test-pvc -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+    PVC_STATUS=$(kubectl get pvc longhorn-test-pvc -o jsonpath="${JSONPATH_PHASE}" 2>/dev/null || echo "")
     if [[ "$PVC_STATUS" == "Bound" ]]; then break; fi
     sleep 1
 done
@@ -161,12 +165,12 @@ spec:
 EOF
 
 for i in $(seq 1 90); do
-    PHASE=$(kubectl get pod -n "$NAMESPACE" longhorn-writer -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
-    if [[ "$PHASE" == "Succeeded" || "$PHASE" == "Failed" ]]; then break; fi
+    PHASE=$(kubectl get pod -n "$NAMESPACE" longhorn-writer -o jsonpath="${JSONPATH_PHASE}" 2>/dev/null || echo "")
+    if [[ "$PHASE" == "${PHASE_SUCCEEDED}" || "$PHASE" == "Failed" ]]; then break; fi
     sleep 1
 done
 
-if [[ "$PHASE" == "Succeeded" ]]; then
+if [[ "$PHASE" == "${PHASE_SUCCEEDED}" ]]; then
     OUTPUT=$(kubectl logs -n "$NAMESPACE" longhorn-writer 2>/dev/null || echo "")
     if [[ "$OUTPUT" == *"longhorn-sentinel-2026"* ]]; then
         log "Pod wrote and read data from Longhorn volume"
@@ -203,12 +207,12 @@ spec:
 EOF
 
 for i in $(seq 1 90); do
-    PHASE=$(kubectl get pod -n "$NAMESPACE" longhorn-reader -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
-    if [[ "$PHASE" == "Succeeded" || "$PHASE" == "Failed" ]]; then break; fi
+    PHASE=$(kubectl get pod -n "$NAMESPACE" longhorn-reader -o jsonpath="${JSONPATH_PHASE}" 2>/dev/null || echo "")
+    if [[ "$PHASE" == "${PHASE_SUCCEEDED}" || "$PHASE" == "Failed" ]]; then break; fi
     sleep 1
 done
 
-if [[ "$PHASE" == "Succeeded" ]]; then
+if [[ "$PHASE" == "${PHASE_SUCCEEDED}" ]]; then
     OUTPUT=$(kubectl logs -n "$NAMESPACE" longhorn-reader 2>/dev/null || echo "")
     if [[ "$OUTPUT" == *"longhorn-sentinel-2026"* ]]; then
         log "Data persisted across pod deletion"
@@ -234,7 +238,7 @@ spec:
 EOF
 
 for i in $(seq 1 30); do
-    PVC_STATUS=$(kubectl get pvc default-sc-test -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+    PVC_STATUS=$(kubectl get pvc default-sc-test -o jsonpath="${JSONPATH_PHASE}" 2>/dev/null || echo "")
     if [[ "$PVC_STATUS" == "Bound" ]]; then break; fi
     sleep 1
 done
@@ -270,9 +274,9 @@ fi
 
 # ─── Summary ───
 echo ""
-echo "========================================="
+echo "${HR_BANNER}"
 echo " Results: ${GREEN}$PASS passed${NC}, ${RED}$FAIL failed${NC}"
-echo "========================================="
+echo "${HR_BANNER}"
 
 if [[ $FAIL -gt 0 ]]; then
     exit 1

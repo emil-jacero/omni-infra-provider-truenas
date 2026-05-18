@@ -46,6 +46,7 @@ func newTestServer(t *testing.T) (pb.CloudProviderClient, func()) {
 	srv := NewServer(nil, cfg, nil, nil, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
 
 	done := make(chan error, 1)
 
@@ -163,6 +164,7 @@ func newTestServerWithDiscoverer(t *testing.T, st state.State, cluster string) (
 	srv := NewServer(zaptest.NewLogger(t), cfg, nil, d, w)
 
 	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
 	done := make(chan error, 1)
 
 	go func() { done <- srv.ServeOnListener(ctx, lis) }()
@@ -434,3 +436,227 @@ func TestServer_NodeGroupIncreaseSize_UnknownGroupReturnsNotFound(t *testing.T) 
 	require.True(t, ok)
 	assert.Equal(t, codes.NotFound, st2.Code())
 }
+
+// --- evaluateCapacityGate switch-arm coverage ----------------------------
+//
+// The four Decision.Outcome arms (DeniedHard, Errored, WarnedSoft, Allowed)
+// each map to a different gRPC status / metric / log shape. These tests
+// pin the mapping so a future edit that swaps codes.ResourceExhausted ↔
+// codes.Unavailable, or drops a recordScaleUpResult metric increment,
+// fails CI immediately.
+
+// newTestServerWithGate boots a Server with a real Discoverer + a
+// caller-supplied CapacityQuery so tests can drive the capacity-gate
+// arms by configuring the fake's response.
+func newTestServerWithGate(t *testing.T, st state.State, cluster string, gate CapacityQuery, defaultPool string) (pb.CloudProviderClient, func()) {
+	t.Helper()
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	cfg := &SubcommandConfig{
+		ClusterName:     cluster,
+		ListenAddress:   lis.Addr().String(),
+		RefreshInterval: time.Minute,
+	}
+
+	d := NewDiscoverer(st, cluster, zaptest.NewLogger(t))
+	w := NewScaleWriter(st)
+	srv := NewServer(zaptest.NewLogger(t), cfg, gate, d, w).WithDefaultPool(defaultPool)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	done := make(chan error, 1)
+
+	go func() { done <- srv.ServeOnListener(ctx, lis) }()
+
+	cfg.ListenAddress = lis.Addr().String()
+
+	var conn *grpc.ClientConn
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		c, err := grpc.NewClient(cfg.ListenAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err == nil {
+			conn = c
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	require.NotNil(t, conn)
+
+	shutdown := func() {
+		_ = conn.Close()
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("server did not shut down within 2s of ctx cancel")
+		}
+	}
+
+	return pb.NewCloudProviderClient(conn), shutdown
+}
+
+// TestNodeGroupIncreaseSize_GateDeniedHard_ReturnsResourceExhausted —
+// OutcomeDeniedHard arm: pool free below floor with capacity-gate=hard
+// must surface as codes.ResourceExhausted and increment
+// recordScaleUpResult with ResultDeniedCapacity.
+func TestNodeGroupIncreaseSize_GateDeniedHard_ReturnsResourceExhausted(t *testing.T) {
+	t.Parallel()
+
+	st := newInMemOmniState(t)
+	seedMachineClass(t, st, "workers", map[string]string{
+		AnnotationAutoscaleMin:            "1",
+		AnnotationAutoscaleMax:            "10",
+		AnnotationAutoscaleCapacityGate:   string(CapacityGateHard),
+		AnnotationAutoscaleMinPoolFreeGiB: "100",
+		AnnotationAutoscaleMinHostMemGiB:  "0",
+	})
+	seedMachineSet(t, st, "talos-home", "talos-home-workers", "workers", 3, false,
+		specs.MachineSetSpec_MachineAllocation_Static)
+
+	// Pool reports 10 GiB free, threshold 100 GiB → DeniedHard.
+	gate := fakeCapacityQuery{
+		pool: func(_ string) (int64, error) { return 10 * 1024 * 1024 * 1024, nil },
+	}
+
+	client, shutdown := newTestServerWithGate(t, st, "talos-home", gate, "default")
+	defer shutdown()
+
+	_, err := client.NodeGroupIncreaseSize(context.Background(), &pb.NodeGroupIncreaseSizeRequest{
+		Id:    "talos-home-workers",
+		Delta: 1,
+	})
+	require.Error(t, err)
+
+	got, ok := status.FromError(err)
+	require.True(t, ok)
+	assert.Equal(t, codes.ResourceExhausted, got.Code(),
+		"hard-deny must surface as ResourceExhausted so CAS backs off this group")
+	assert.Contains(t, got.Message(), "capacity gate denied")
+}
+
+// TestNodeGroupIncreaseSize_GateErrored_ReturnsUnavailable —
+// OutcomeErrored arm: a TrueNAS query failure must surface as
+// codes.Unavailable (CAS retries later) rather than ResourceExhausted
+// (CAS stops retrying).
+func TestNodeGroupIncreaseSize_GateErrored_ReturnsUnavailable(t *testing.T) {
+	t.Parallel()
+
+	st := newInMemOmniState(t)
+	seedMachineClass(t, st, "workers", map[string]string{
+		AnnotationAutoscaleMin:            "1",
+		AnnotationAutoscaleMax:            "10",
+		AnnotationAutoscaleCapacityGate:   string(CapacityGateHard),
+		AnnotationAutoscaleMinPoolFreeGiB: "100",
+		AnnotationAutoscaleMinHostMemGiB:  "0",
+	})
+	seedMachineSet(t, st, "talos-home", "talos-home-workers", "workers", 3, false,
+		specs.MachineSetSpec_MachineAllocation_Static)
+
+	gate := fakeCapacityQuery{
+		pool: func(_ string) (int64, error) {
+			return 0, fmtError("transient TrueNAS API failure")
+		},
+	}
+
+	client, shutdown := newTestServerWithGate(t, st, "talos-home", gate, "default")
+	defer shutdown()
+
+	_, err := client.NodeGroupIncreaseSize(context.Background(), &pb.NodeGroupIncreaseSizeRequest{
+		Id:    "talos-home-workers",
+		Delta: 1,
+	})
+	require.Error(t, err)
+
+	got, ok := status.FromError(err)
+	require.True(t, ok)
+	assert.Equal(t, codes.Unavailable, got.Code(),
+		"errored gate must surface as Unavailable so CAS retries (not ResourceExhausted, which stops retries)")
+	assert.Contains(t, got.Message(), "capacity gate query failed")
+}
+
+// TestNodeGroupIncreaseSize_GateSoftWarn_ProceedsToWriter —
+// OutcomeWarnedSoft arm: capacity-gate=soft + below-threshold must
+// log a warn but still proceed to the writer (the scale-up completes).
+func TestNodeGroupIncreaseSize_GateSoftWarn_ProceedsToWriter(t *testing.T) {
+	t.Parallel()
+
+	st := newInMemOmniState(t)
+	seedMachineClass(t, st, "workers", map[string]string{
+		AnnotationAutoscaleMin:            "1",
+		AnnotationAutoscaleMax:            "10",
+		AnnotationAutoscaleCapacityGate:   string(CapacityGateSoft),
+		AnnotationAutoscaleMinPoolFreeGiB: "100",
+		AnnotationAutoscaleMinHostMemGiB:  "0",
+	})
+	seedMachineSet(t, st, "talos-home", "talos-home-workers", "workers", 3, false,
+		specs.MachineSetSpec_MachineAllocation_Static)
+
+	// 10 GiB free under a 100 GiB soft threshold → WarnedSoft.
+	gate := fakeCapacityQuery{
+		pool: func(_ string) (int64, error) { return 10 * 1024 * 1024 * 1024, nil },
+	}
+
+	client, shutdown := newTestServerWithGate(t, st, "talos-home", gate, "default")
+	defer shutdown()
+
+	_, err := client.NodeGroupIncreaseSize(context.Background(), &pb.NodeGroupIncreaseSizeRequest{
+		Id:    "talos-home-workers",
+		Delta: 2,
+	})
+	require.NoError(t, err, "soft-warn must NOT block scale-up")
+
+	got, err := safe.StateGetByID[*omni.MachineSet](context.Background(), st, "talos-home-workers")
+	require.NoError(t, err)
+	assert.Equal(t, uint32(5), got.TypedSpec().Value.MachineAllocation.MachineCount,
+		"writer must have applied the delta even on soft-warn")
+}
+
+// TestNodeGroupIncreaseSize_GateAllowed_ProceedsToWriter — OutcomeAllowed
+// arm: pool above threshold + gate=hard must allow and write the delta.
+// Pins the "no metric on the success arm beyond the writer's path" claim.
+func TestNodeGroupIncreaseSize_GateAllowed_ProceedsToWriter(t *testing.T) {
+	t.Parallel()
+
+	st := newInMemOmniState(t)
+	seedMachineClass(t, st, "workers", map[string]string{
+		AnnotationAutoscaleMin:            "1",
+		AnnotationAutoscaleMax:            "10",
+		AnnotationAutoscaleCapacityGate:   string(CapacityGateHard),
+		AnnotationAutoscaleMinPoolFreeGiB: "10",
+		AnnotationAutoscaleMinHostMemGiB:  "0",
+	})
+	seedMachineSet(t, st, "talos-home", "talos-home-workers", "workers", 3, false,
+		specs.MachineSetSpec_MachineAllocation_Static)
+
+	// 100 GiB free above 10 GiB hard threshold → Allowed.
+	gate := fakeCapacityQuery{
+		pool: func(_ string) (int64, error) { return 100 * 1024 * 1024 * 1024, nil },
+	}
+
+	client, shutdown := newTestServerWithGate(t, st, "talos-home", gate, "default")
+	defer shutdown()
+
+	_, err := client.NodeGroupIncreaseSize(context.Background(), &pb.NodeGroupIncreaseSizeRequest{
+		Id:    "talos-home-workers",
+		Delta: 1,
+	})
+	require.NoError(t, err)
+
+	got, err := safe.StateGetByID[*omni.MachineSet](context.Background(), st, "talos-home-workers")
+	require.NoError(t, err)
+	assert.Equal(t, uint32(4), got.TypedSpec().Value.MachineAllocation.MachineCount)
+}
+
+// fmtError is a tiny helper so the table tests above don't pull in errors.
+// It's a one-line stand-in for fmt.Errorf where the test only needs a
+// throwaway error value.
+func fmtError(s string) error {
+	return &simpleErr{msg: s}
+}
+
+type simpleErr struct{ msg string }
+
+func (e *simpleErr) Error() string { return e.msg }

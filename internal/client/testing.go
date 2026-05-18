@@ -58,6 +58,52 @@ func NewMockClient(handler MockHandler) *Client {
 	return newClient(&MockTransport{Handler: handler}, defaultMaxConcurrentCalls)
 }
 
+// MockHandlerCtx is a ctx-aware variant of MockHandler used by tests that
+// need to assert ctx.Err() on the call site (e.g., to verify a
+// context.WithoutCancel handoff).
+type MockHandlerCtx func(ctx context.Context, method string, params json.RawMessage) (any, error)
+
+// MockTransportCtx implements Transport for tests that need ctx visibility.
+type MockTransportCtx struct {
+	Handler MockHandlerCtx
+}
+
+func (t *MockTransportCtx) Name() string  { return "mock-ctx" }
+func (t *MockTransportCtx) Close() error  { return nil }
+func (t *MockTransportCtx) UploadFile(_ context.Context, _ string, _ io.Reader, _ int64) error {
+	return nil
+}
+
+func (t *MockTransportCtx) Call(ctx context.Context, method string, params any, result any) error {
+	rawParams, err := json.Marshal(params)
+	if err != nil {
+		return fmt.Errorf("mock-ctx: failed to marshal params: %w", err)
+	}
+
+	resp, rpcErr := t.Handler(ctx, method, rawParams)
+	if rpcErr != nil {
+		return rpcErr
+	}
+
+	if result != nil && resp != nil {
+		data, err := json.Marshal(resp)
+		if err != nil {
+			return fmt.Errorf("mock-ctx: failed to marshal response: %w", err)
+		}
+		if err := json.Unmarshal(data, result); err != nil {
+			return fmt.Errorf("mock-ctx: failed to unmarshal into result: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// NewMockClientCtx creates a Client backed by MockTransportCtx so tests can
+// observe ctx on each call. Use NewMockClient unless you need ctx visibility.
+func NewMockClientCtx(handler MockHandlerCtx) *Client {
+	return newClient(&MockTransportCtx{Handler: handler}, defaultMaxConcurrentCalls)
+}
+
 // TransportOf returns the client's underlying transport. Exported for cross-package test use.
 func TransportOf(c *Client) Transport {
 	return c.transport

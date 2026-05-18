@@ -202,21 +202,43 @@ type poisonSetter interface {
 // call and the four-arm switch on tofuResult lives next to the helper
 // that produces it. The previous inline form was 80 lines and 4 levels
 // of nesting in the middle of stepUploadISO.
-func (p *Provisioner) verifyCachedISO(
-	ctx context.Context,
-	logger *zap.Logger,
-	isoDataset, isoPath, imageID string,
-	hashProp, sizeProp, mtimeProp string,
-	stat *client.FileInfo,
-) error {
-	props, err := p.client.GetDatasetUserProperties(ctx, isoDataset)
+// isoCacheRef bundles the locator + property keys for one cached ISO.
+// Lifted out so the three TOFU helpers (verifyCachedISO, recordTOFUProperty,
+// setIfPoisonable) can take a single struct argument instead of the 6-7
+// stringly-typed positional params they previously shared.
+//
+// Always construct via newISOCacheRef so the three property names stay
+// derived from imageID — direct struct literals risk an imageID/hashProp
+// mismatch that no compiler check catches.
+type isoCacheRef struct {
+	dataset, path, imageID        string
+	hashProp, sizeProp, mtimeProp string
+}
+
+// newISOCacheRef builds the canonical isoCacheRef for an (dataset, path,
+// imageID) triple. The three TOFU property keys are derived from imageID
+// via the same constructors used everywhere else — no caller has to
+// remember the property-name conventions.
+func newISOCacheRef(dataset, path, imageID string) isoCacheRef {
+	return isoCacheRef{
+		dataset:   dataset,
+		path:      path,
+		imageID:   imageID,
+		hashProp:  isoHashProperty(imageID),
+		sizeProp:  isoSizeProperty(imageID),
+		mtimeProp: isoMtimeProperty(imageID),
+	}
+}
+
+func (p *Provisioner) verifyCachedISO(ctx context.Context, logger *zap.Logger, ref isoCacheRef, stat *client.FileInfo) error {
+	props, err := p.client.GetDatasetUserProperties(ctx, ref.dataset)
 	if err != nil {
-		return fmt.Errorf("failed to read TOFU baseline for cached ISO %s: %w — refusing to reuse cached bytes without verification", imageID, err)
+		return fmt.Errorf("failed to read TOFU baseline for cached ISO %s: %w — refusing to reuse cached bytes without verification", ref.imageID, err)
 	}
 
-	storedHash := props[hashProp]
+	storedHash := props[ref.hashProp]
 	if cachedISOPoisoned(storedHash) {
-		return fmt.Errorf("ISO %s is marked POISONED from a prior factory-compromise detection — delete %s on TrueNAS and retry (see docs/hardening.md)", imageID, isoPath)
+		return fmt.Errorf("ISO %s is marked POISONED from a prior factory-compromise detection — delete %s on TrueNAS and retry (see docs/hardening.md)", ref.imageID, ref.path)
 	}
 
 	if storedHash == "" {
@@ -226,7 +248,7 @@ func (p *Provisioner) verifyCachedISO(
 		return nil
 	}
 
-	result, vErr := verifyISOMetadata(props[sizeProp], props[mtimeProp], stat)
+	result, vErr := verifyISOMetadata(props[ref.sizeProp], props[ref.mtimeProp], stat)
 	switch result {
 	case tofuMatch:
 		return nil
@@ -236,20 +258,20 @@ func (p *Provisioner) verifyCachedISO(
 		// now using the live stat so the next cache hit gets the full
 		// triple. Best-effort: a write failure is logged + countered
 		// inside recordTOFUProperty but does not block the provision.
-		recordTOFUProperty(ctx, logger, p.client, isoDataset, sizeProp, strconv.FormatInt(stat.Size, 10), "size", imageID)
-		recordTOFUProperty(ctx, logger, p.client, isoDataset, mtimeProp, formatISOMtime(stat.Mtime), "mtime", imageID)
+		recordTOFUProperty(ctx, logger, p.client, ref, ref.sizeProp, strconv.FormatInt(stat.Size, 10), "size")
+		recordTOFUProperty(ctx, logger, p.client, ref, ref.mtimeProp, formatISOMtime(stat.Mtime), "mtime")
 		return nil
 
 	case tofuMismatch:
-		persisted := setIfPoisonable(ctx, logger, p.client, isoDataset, hashProp, poisonMarker(storedHash), imageID, isoPath)
+		persisted := setIfPoisonable(ctx, logger, p.client, ref, ref.hashProp, poisonMarker(storedHash))
 
 		if telemetry.ISOHashMismatches != nil {
 			telemetry.ISOHashMismatches.Add(ctx, 1, metric.WithAttributes(attribute.String("detection_path", "cache_hit_metadata")))
 		}
 
 		logger.Error("cached ISO metadata drift — possible at-rest tamper",
-			zap.String("image_id", imageID),
-			zap.String("iso_path", isoPath),
+			zap.String("image_id", ref.imageID),
+			zap.String("iso_path", ref.path),
 			zap.Bool("poison_marker_persisted", persisted),
 			zap.Error(vErr),
 		)
@@ -259,14 +281,14 @@ func (p *Provisioner) verifyCachedISO(
 			msg += " (POISON marker NOT persisted; on-disk bytes still trusted by next run)"
 		}
 
-		return fmt.Errorf(msg, imageID, vErr, isoPath)
+		return fmt.Errorf(msg, ref.imageID, vErr, ref.path)
 	}
 
 	// tofuPoisoned would only be reachable if classifyTOFU's poison
 	// detection drifted from cachedISOPoisoned's; both share poisonedPrefix
 	// today so this is dead code, included only to keep the switch
 	// exhaustive against future tofuResult additions.
-	return fmt.Errorf("verifyCachedISO: unexpected tofuResult %d for ISO %s", result, imageID)
+	return fmt.Errorf("verifyCachedISO: unexpected tofuResult %d for ISO %s", result, ref.imageID)
 }
 
 // reverifyISOBeforeAttach is the TOCTOU defense between cache-hit
@@ -294,8 +316,7 @@ func (p *Provisioner) reverifyISOBeforeAttach(ctx context.Context, logger *zap.L
 		return fmt.Errorf("ISO %s vanished between upload and CDROM attach — refusing to attach a missing path", isoPath)
 	}
 
-	return p.verifyCachedISO(ctx, logger, isoDataset, isoPath, imageID,
-		isoHashProperty(imageID), isoSizeProperty(imageID), isoMtimeProperty(imageID), stat)
+	return p.verifyCachedISO(ctx, logger, newISOCacheRef(isoDataset, isoPath, imageID), stat)
 }
 
 // recordTOFUProperty writes one of the three TOFU companion properties
@@ -304,10 +325,10 @@ func (p *Provisioner) reverifyISOBeforeAttach(ctx context.Context, logger *zap.L
 // near-identical try-and-warn blocks at the upload site into a single
 // call site each, and gives operators a metric (rather than a log
 // scrape) to alert on a degrading property RPC.
-func recordTOFUProperty(ctx context.Context, logger *zap.Logger, c poisonSetter, dataset, key, value, field, imageID string) {
-	if err := c.SetDatasetUserProperty(ctx, dataset, key, value); err != nil {
+func recordTOFUProperty(ctx context.Context, logger *zap.Logger, c poisonSetter, ref isoCacheRef, key, value, field string) {
+	if err := c.SetDatasetUserProperty(ctx, ref.dataset, key, value); err != nil {
 		logger.Warn("failed to record ISO TOFU companion property — cache-hit re-verification will degrade for this field",
-			zap.String("image_id", imageID),
+			zap.String("image_id", ref.imageID),
 			zap.String("field", field),
 			zap.Error(err),
 		)
@@ -340,7 +361,7 @@ const poisonRetryDelay = 500 * time.Millisecond
 // operators can graph a degrading property RPC before the retries exhaust;
 // increments ISOPoisonMarkerWriteFailed exactly once if every attempt
 // fails, giving alerting a metric to fire on rather than a log-string match.
-func setIfPoisonable(ctx context.Context, logger *zap.Logger, c poisonSetter, dataset, key, marker, imageID, isoPath string) (persisted bool) {
+func setIfPoisonable(ctx context.Context, logger *zap.Logger, c poisonSetter, ref isoCacheRef, key, marker string) (persisted bool) {
 	var lastErr error
 
 	// Hoist the timer outside the loop so a `time.After` per iteration does
@@ -358,7 +379,7 @@ func setIfPoisonable(ctx context.Context, logger *zap.Logger, c poisonSetter, da
 
 retry:
 	for attempt := 1; attempt <= poisonRetryAttempts; attempt++ {
-		err := c.SetDatasetUserProperty(ctx, dataset, key, marker)
+		err := c.SetDatasetUserProperty(ctx, ref.dataset, key, marker)
 		if err == nil {
 			return true
 		}
@@ -395,9 +416,9 @@ retry:
 	}
 
 	logger.Error("MANUAL CLEANUP REQUIRED — failed to persist ISO POISON marker after retries; the on-disk bytes are confirmed bad and remain accessible. Delete the file from TrueNAS before re-provisioning.",
-		zap.String("image_id", imageID),
-		zap.String("iso_path", isoPath),
-		zap.String("dataset", dataset),
+		zap.String("image_id", ref.imageID),
+		zap.String("iso_path", ref.path),
+		zap.String("dataset", ref.dataset),
 		zap.String("property", key),
 		zap.Error(lastErr),
 	)

@@ -98,7 +98,7 @@ func TestUploadClient_RefusesRedirect(t *testing.T) {
 			require.NoError(t, err)
 			req.Header.Set("Authorization", "Bearer test-secret-key")
 
-			resp, err := newProbeUploadClient().Do(req)
+			resp, err := newProbeUploadClient(false).Do(req)
 			require.NoError(t, err)
 			defer func() { _ = resp.Body.Close() }()
 

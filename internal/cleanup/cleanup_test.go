@@ -761,3 +761,74 @@ func TestRunOnce_MixedScenario_CorrectCleanup(t *testing.T) {
 	assert.Equal(t, []string{"default/omni-vms/crashed-worker"}, deletedZvols,
 		"should only delete zvol whose VM is gone")
 }
+
+// TestMaybeDeleteOrphanVM_LegacyVMNoRequestID_Skipped pins the v0.15.3
+// fix that protected against the mass-delete incident: VMs whose
+// description doesn't carry the `(request-id: ...)` suffix must be
+// skipped from this cleanup path entirely. A regression here previously
+// killed 7+ freshly-created cluster members minutes after provision
+// finished (CHANGELOG v0.15.3) because Name-based request-id derivation
+// silently miscomputed the id on v0.15+ namespaced VMs.
+func TestMaybeDeleteOrphanVM_LegacyVMNoRequestID_Skipped(t *testing.T) {
+	var deleted []int
+	cl := testCleaner(func(method string, params json.RawMessage) (any, error) {
+		switch method {
+		case "vm.query":
+			// Two omni-named VMs without a parseable request-id in the
+			// description: one bare prefix (legacy v0.14 shape), one
+			// look-alike with operator-typed notes.
+			return []client.VM{
+				{ID: 10, Name: "omni_truenas_legacy_one", Description: "Managed by Omni infra provider"},
+				{ID: 11, Name: "omni_truenas_lookalike", Description: "some manual notes"},
+			}, nil
+		case "vm.stop":
+			return nil, nil
+		case "vm.delete":
+			var args []json.RawMessage
+			_ = json.Unmarshal(params, &args)
+			var id int
+			_ = json.Unmarshal(args[0], &id)
+			deleted = append(deleted, id)
+			return nil, nil
+		}
+		return nil, nil
+	}, map[string]bool{})
+
+	cl.cleanupOrphanVMs(context.Background(), managedZvols(), nil)
+
+	assert.Empty(t, deleted,
+		"VMs without parseable request-id MUST NOT be deleted — that was the v0.15.3 mass-delete incident root cause")
+}
+
+// TestMaybeDeleteOrphanVM_RequestIDNotInLiveSet_Deleted is the
+// counter-positive: a properly-tagged VM whose request-id is NOT in the
+// live MachineRequest set must be deleted as an orphan. Without this,
+// the "v0.15.3 fix" reading too broadly would skip legitimate orphans.
+func TestMaybeDeleteOrphanVM_RequestIDNotInLiveSet_Deleted(t *testing.T) {
+	var deleted []int
+	cl := testCleaner(func(method string, params json.RawMessage) (any, error) {
+		switch method {
+		case "vm.query":
+			return []client.VM{
+				{ID: 42, Name: "omni_truenas_ghost", Description: "Managed by Omni infra provider (request-id: ghost-machine)"},
+			}, nil
+		case "vm.stop":
+			return nil, nil
+		case "vm.delete":
+			var args []json.RawMessage
+			_ = json.Unmarshal(params, &args)
+			var id int
+			_ = json.Unmarshal(args[0], &id)
+			deleted = append(deleted, id)
+			return nil, nil
+		}
+		return nil, nil
+	}, map[string]bool{})
+
+	// liveRequests does NOT contain "ghost-machine" — Omni has forgotten
+	// this MachineRequest, so the VM is a confirmed orphan.
+	cl.cleanupOrphanVMs(context.Background(), managedZvols("ghost-machine"), map[string]bool{})
+
+	assert.Equal(t, []int{42}, deleted,
+		"VM whose request-id is absent from the live MachineRequest set must be deleted")
+}

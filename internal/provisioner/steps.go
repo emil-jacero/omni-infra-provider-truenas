@@ -218,199 +218,181 @@ func (p *Provisioner) stepUploadISO(ctx context.Context, logger *zap.Logger, pct
 	isoDataset := data.BasePath() + "/talos-iso"
 	isoPath := "/mnt/" + isoDataset + "/" + isoFileName
 
-	hashProp := isoHashProperty(imageID)
-	sizeProp := isoSizeProperty(imageID)
-	mtimeProp := isoMtimeProperty(imageID)
+	ref := newISOCacheRef(isoDataset, isoPath, imageID)
 
 	// Use singleflight to prevent concurrent downloads of the same ISO
 	_, err, _ = p.isoGroup.Do(imageID, func() (any, error) {
-		// One stat call serves both purposes: existence (stat == nil → cache
-		// miss) and the size/mtime view that verifyCachedISO compares against
-		// the recorded TOFU baseline. The previous code did FileExists and
-		// then StatFile separately, paying two filesystem.stat RPCs per
-		// cache-hit provision for the same path.
-		stat, err := p.client.StatFile(ctx, isoPath)
-		if err != nil {
-			return nil, fmt.Errorf("failed to stat ISO %s: %w", isoPath, err)
-		}
-
-		if stat != nil {
-			if err := p.verifyCachedISO(ctx, logger, isoDataset, isoPath, imageID, hashProp, sizeProp, mtimeProp, stat); err != nil {
-				return nil, err
-			}
-
-			logger.Debug("ISO already exists, skipping download", zap.String("path", isoPath))
-			if telemetry.ISOCacheHits != nil {
-				telemetry.ISOCacheHits.Add(ctx, 1)
-			}
-
-			return nil, nil
-		}
-
-		// Ensure the dataset hierarchy exists
-		if data.DatasetPrefix != "" {
-			if err := p.client.EnsureDataset(ctx, data.BasePath()); err != nil {
-				return nil, fmt.Errorf("failed to ensure dataset prefix: %w", err)
-			}
-		}
-
-		if err := p.client.EnsureDataset(ctx, isoDataset); err != nil {
-			return nil, fmt.Errorf("failed to ensure ISO dataset: %w", err)
-		}
-
-		if telemetry.ISOCacheMisses != nil {
-			telemetry.ISOCacheMisses.Add(ctx, 1)
-		}
-
-		// TOFU (trust-on-first-use) supply-chain hash: on the first download
-		// for this imageID we just record the SHA-256. On subsequent
-		// downloads (cache loss + re-provision), we compare against the
-		// recorded hash. Mismatch means someone changed the bytes under the
-		// same factory URL — the ISO is treated as compromised.
-		//
-		// Capture the read error explicitly. A previous version dropped it,
-		// which made any transient property-read failure indistinguishable
-		// from the legitimate first-use case (storedHash == "") and let an
-		// attacker who could induce a single failed RPC silently rotate the
-		// TOFU baseline to bytes of their choosing.
-		expectedHash, err := p.client.GetDatasetUserProperty(ctx, isoDataset, hashProp)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read TOFU baseline hash for %s: %w — refusing to provision; retry once the property RPC is healthy", imageID, err)
-		}
-
-		if cachedISOPoisoned(expectedHash) {
-			return nil, fmt.Errorf("ISO %s is marked POISONED from a prior factory-compromise detection — delete %s on TrueNAS and retry", imageID, isoPath)
-		}
-
-		isoStart := time.Now()
-
-		logger.Info("downloading Talos ISO",
-			zap.String("url", imageURL.String()),
-			zap.String("dest", isoPath),
-			zap.Bool("tofu_pinned", expectedHash != ""),
-		)
-
-		// Download ISO from image factory
-		isoReq, err := http.NewRequestWithContext(ctx, http.MethodGet, imageURL.String(), nil) //nolint:gosec
-		if err != nil {
-			return nil, fmt.Errorf("failed to create ISO download request: %w", err)
-		}
-
-		resp, err := isoHTTPClient.Do(isoReq)
-		if err != nil {
-			return nil, fmt.Errorf("failed to download ISO: %w", err)
-		}
-		defer func() { _ = resp.Body.Close() }()
-
-		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("ISO download returned status %d", resp.StatusCode)
-		}
-
-		// Reject impossibly-large ISOs before reading. ContentLength is
-		// advisory (factory may chunk-encode), so this is defense-in-depth
-		// alongside the LimitReader below.
-		if resp.ContentLength > 0 && resp.ContentLength > maxISODownloadBytes {
-			return nil, fmt.Errorf("ISO Content-Length %d exceeds cap %d — refusing to download", resp.ContentLength, maxISODownloadBytes)
-		}
-
-		// Cap the actual byte stream regardless of Content-Length. If the
-		// factory exceeds the cap we want the read to error rather than
-		// fill the zvol. io.LimitReader returns EOF at the cap which would
-		// look like a successful short read; wrap so callers see an error.
-		limited := &io.LimitedReader{R: resp.Body, N: maxISODownloadBytes + 1}
-
-		// Compute SHA-256 while streaming to TrueNAS so we don't buffer the
-		// entire ISO in memory. Hash is only usable after upload completes.
-		hasher := sha256.New()
-		teed := io.TeeReader(limited, hasher)
-
-		// Upload to TrueNAS
-		if err := p.client.UploadFile(ctx, isoPath, teed, resp.ContentLength); err != nil {
-			return nil, fmt.Errorf("failed to upload ISO to TrueNAS: %w", err)
-		}
-
-		// Detect cap-exceeded: if N reached 0 we read maxISODownloadBytes+1
-		// without EOF — the body was larger than the cap.
-		if limited.N == 0 {
-			return nil, fmt.Errorf("ISO download exceeded cap of %d bytes — possible factory compromise or unbounded response, refusing", maxISODownloadBytes)
-		}
-
-		downloadedHash := hex.EncodeToString(hasher.Sum(nil))
-
-		if classifyTOFU(expectedHash, downloadedHash) == tofuMismatch {
-			// Mismatch: mark the stored hash with POISONED- prefix so a
-			// future provision refuses to use this ISO (cache hit branch
-			// checks the poison marker). Fail the current provision loudly.
-			//
-			// The previous version dropped the SetDatasetUserProperty error,
-			// which meant a transient marker-write failure left the
-			// confirmed-bad bytes accessible with the *trusted* baseline
-			// still in place — a future cache hit would silently reuse
-			// them. setIfPoisonable retries the write with backoff and
-			// surfaces a "MANUAL CLEANUP REQUIRED" log if every attempt
-			// fails so operators know to delete the file by hand.
-			persisted := setIfPoisonable(ctx, logger, p.client, isoDataset, hashProp, poisonMarker(downloadedHash), imageID, isoPath)
-
-			if telemetry.ISOHashMismatches != nil {
-				telemetry.ISOHashMismatches.Add(ctx, 1, metric.WithAttributes(attribute.String("detection_path", "download")))
-			}
-
-			logger.Error("ISO hash mismatch — possible supply-chain compromise at factory.talos.dev",
-				zap.String("image_id", imageID),
-				zap.String("expected_sha256", expectedHash),
-				zap.String("got_sha256", downloadedHash),
-				zap.String("iso_path", isoPath),
-				zap.Bool("poison_marker_persisted", persisted),
-			)
-
-			msg := "ISO hash mismatch for %s: expected %s, got %s — delete %s and rotate factory trust before retrying"
-			if !persisted {
-				msg += " (POISON marker NOT persisted; on-disk bytes still trusted by next run)"
-			}
-
-			return nil, fmt.Errorf(msg, imageID, expectedHash, downloadedHash, isoPath)
-		}
-
-		// Stat the just-uploaded file to capture size + mtime alongside the
-		// hash. These three properties together let a future cache hit
-		// detect a post-baseline byte swap without requiring a re-hash of
-		// the on-disk bytes (which TrueNAS doesn't expose a streaming RPC
-		// for — pulling the bytes back to hash them locally would itself
-		// be a DoS surface).
-		uploadedStat, statErr := p.client.StatFile(ctx, isoPath)
-		if statErr != nil {
-			// Best-effort: don't fail the provision because we can't read
-			// our own upload back. The cache hit re-verification will
-			// gracefully degrade to "first-use" for the missing fields.
-			logger.Warn("failed to stat uploaded ISO for TOFU metadata — cache-hit re-verification will degrade to first-use",
-				zap.String("path", isoPath),
-				zap.Error(statErr),
-			)
-		}
-
-		// Record the hash so future downloads of this imageID are verified.
-		// Non-fatal: if the set fails we still return success because the
-		// upload succeeded and the hash comparison is a best-effort defense.
-		recordTOFUProperty(ctx, logger, p.client, isoDataset, hashProp, downloadedHash, "hash", imageID)
-
-		if uploadedStat != nil {
-			recordTOFUProperty(ctx, logger, p.client, isoDataset, sizeProp, strconv.FormatInt(uploadedStat.Size, 10), "size", imageID)
-			recordTOFUProperty(ctx, logger, p.client, isoDataset, mtimeProp, formatISOMtime(uploadedStat.Mtime), "mtime", imageID)
-		}
-
-		if telemetry.ISODownloadDuration != nil {
-			telemetry.ISODownloadDuration.Record(ctx, time.Since(isoStart).Seconds())
-		}
-
-		logger.Info("ISO uploaded successfully",
-			zap.String("path", isoPath),
-			zap.String("sha256", downloadedHash),
-		)
-
-		return nil, nil
+		return nil, p.downloadOrReuseISO(ctx, logger, ref, data, imageURL)
 	})
 
 	return err
+}
+
+// downloadOrReuseISO is the body of the singleflight closure inside
+// stepUploadISO. On cache hit it verifies the on-disk bytes against the TOFU
+// baseline; on cache miss it ensures parent datasets exist, downloads the
+// ISO from Image Factory, streams it to TrueNAS while computing SHA-256,
+// and records the TOFU triple (hash + size + mtime). Lifted out of
+// stepUploadISO so the function's cognitive complexity stays bounded — the
+// previous inline form was the single biggest contributor to step-level
+// complexity in the package.
+func (p *Provisioner) downloadOrReuseISO(ctx context.Context, logger *zap.Logger, ref isoCacheRef, data Data, imageURL *url.URL) error {
+	stat, err := p.client.StatFile(ctx, ref.path)
+	if err != nil {
+		return fmt.Errorf("failed to stat ISO %s: %w", ref.path, err)
+	}
+
+	if stat != nil {
+		if err := p.verifyCachedISO(ctx, logger, ref, stat); err != nil {
+			return err
+		}
+
+		logger.Debug("ISO already exists, skipping download", zap.String("path", ref.path))
+		if telemetry.ISOCacheHits != nil {
+			telemetry.ISOCacheHits.Add(ctx, 1)
+		}
+		return nil
+	}
+
+	if err := p.ensureISODatasets(ctx, data, ref.dataset); err != nil {
+		return err
+	}
+
+	if telemetry.ISOCacheMisses != nil {
+		telemetry.ISOCacheMisses.Add(ctx, 1)
+	}
+
+	expectedHash, err := p.client.GetDatasetUserProperty(ctx, ref.dataset, ref.hashProp)
+	if err != nil {
+		return fmt.Errorf("failed to read TOFU baseline hash for %s: %w — refusing to provision; retry once the property RPC is healthy", ref.imageID, err)
+	}
+	if cachedISOPoisoned(expectedHash) {
+		return fmt.Errorf("ISO %s is marked POISONED from a prior factory-compromise detection — delete %s on TrueNAS and retry", ref.imageID, ref.path)
+	}
+
+	isoStart := time.Now()
+	logger.Info("downloading Talos ISO",
+		zap.String("url", imageURL.String()),
+		zap.String("dest", ref.path),
+		zap.Bool("tofu_pinned", expectedHash != ""),
+	)
+
+	downloadedHash, err := p.downloadAndUploadISO(ctx, ref.path, imageURL.String())
+	if err != nil {
+		return err
+	}
+
+	if classifyTOFU(expectedHash, downloadedHash) == tofuMismatch {
+		return p.handleISOHashMismatch(ctx, logger, ref, expectedHash, downloadedHash)
+	}
+
+	uploadedStat, statErr := p.client.StatFile(ctx, ref.path)
+	if statErr != nil {
+		// Best-effort: cache-hit re-verification will degrade to "first-use"
+		// for the missing fields if we can't read our own upload back.
+		logger.Warn("failed to stat uploaded ISO for TOFU metadata — cache-hit re-verification will degrade to first-use",
+			zap.String("path", ref.path),
+			zap.Error(statErr),
+		)
+	}
+
+	recordTOFUProperty(ctx, logger, p.client, ref, ref.hashProp, downloadedHash, "hash")
+	if uploadedStat != nil {
+		recordTOFUProperty(ctx, logger, p.client, ref, ref.sizeProp, strconv.FormatInt(uploadedStat.Size, 10), "size")
+		recordTOFUProperty(ctx, logger, p.client, ref, ref.mtimeProp, formatISOMtime(uploadedStat.Mtime), "mtime")
+	}
+
+	if telemetry.ISODownloadDuration != nil {
+		telemetry.ISODownloadDuration.Record(ctx, time.Since(isoStart).Seconds())
+	}
+
+	logger.Info("ISO uploaded successfully",
+		zap.String("path", ref.path),
+		zap.String("sha256", downloadedHash),
+	)
+
+	return nil
+}
+
+// ensureISODatasets creates the dataset prefix (if configured) and the ISO
+// dataset hierarchy ahead of an ISO upload.
+func (p *Provisioner) ensureISODatasets(ctx context.Context, data Data, isoDataset string) error {
+	if data.DatasetPrefix != "" {
+		if err := p.client.EnsureDataset(ctx, data.BasePath()); err != nil {
+			return fmt.Errorf("failed to ensure dataset prefix: %w", err)
+		}
+	}
+	if err := p.client.EnsureDataset(ctx, isoDataset); err != nil {
+		return fmt.Errorf("failed to ensure ISO dataset: %w", err)
+	}
+	return nil
+}
+
+// downloadAndUploadISO fetches the ISO from Image Factory, streams it
+// straight to TrueNAS while computing SHA-256, and returns the hash. Caps
+// the byte stream defensively against an unbounded factory response.
+func (p *Provisioner) downloadAndUploadISO(ctx context.Context, isoPath, imageURL string) (string, error) {
+	isoReq, err := http.NewRequestWithContext(ctx, http.MethodGet, imageURL, nil) //nolint:gosec
+	if err != nil {
+		return "", fmt.Errorf("failed to create ISO download request: %w", err)
+	}
+
+	resp, err := isoHTTPClient.Do(isoReq)
+	if err != nil {
+		return "", fmt.Errorf("failed to download ISO: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("ISO download returned status %d", resp.StatusCode)
+	}
+
+	// ContentLength is advisory; defense-in-depth alongside the LimitReader.
+	if resp.ContentLength > 0 && resp.ContentLength > maxISODownloadBytes {
+		return "", fmt.Errorf("ISO Content-Length %d exceeds cap %d — refusing to download", resp.ContentLength, maxISODownloadBytes)
+	}
+
+	// io.LimitReader returns EOF at the cap; wrap so we can distinguish
+	// cap-exceeded from a clean short read.
+	limited := &io.LimitedReader{R: resp.Body, N: maxISODownloadBytes + 1}
+	hasher := sha256.New()
+	teed := io.TeeReader(limited, hasher)
+
+	if err := p.client.UploadFile(ctx, isoPath, teed, resp.ContentLength); err != nil {
+		return "", fmt.Errorf("failed to upload ISO to TrueNAS: %w", err)
+	}
+
+	if limited.N == 0 {
+		return "", fmt.Errorf("ISO download exceeded cap of %d bytes — possible factory compromise or unbounded response, refusing", maxISODownloadBytes)
+	}
+
+	return hex.EncodeToString(hasher.Sum(nil)), nil
+}
+
+// handleISOHashMismatch writes the POISON marker (with retries inside
+// setIfPoisonable), logs the supply-chain alert, and returns a fatal error
+// with operator-actionable language.
+func (p *Provisioner) handleISOHashMismatch(ctx context.Context, logger *zap.Logger, ref isoCacheRef, expectedHash, downloadedHash string) error {
+	persisted := setIfPoisonable(ctx, logger, p.client, ref, ref.hashProp, poisonMarker(downloadedHash))
+
+	if telemetry.ISOHashMismatches != nil {
+		telemetry.ISOHashMismatches.Add(ctx, 1, metric.WithAttributes(attribute.String("detection_path", "download")))
+	}
+
+	logger.Error("ISO hash mismatch — possible supply-chain compromise at factory.talos.dev",
+		zap.String("image_id", ref.imageID),
+		zap.String("expected_sha256", expectedHash),
+		zap.String("got_sha256", downloadedHash),
+		zap.String("iso_path", ref.path),
+		zap.Bool("poison_marker_persisted", persisted),
+	)
+
+	msg := "ISO hash mismatch for %s: expected %s, got %s — delete %s and rotate factory trust before retrying"
+	if !persisted {
+		msg += " (POISON marker NOT persisted; on-disk bytes still trusted by next run)"
+	}
+
+	return fmt.Errorf(msg, ref.imageID, expectedHash, downloadedHash, ref.path)
 }
 
 // stepCreateVM creates the VM on TrueNAS with disk, CDROM, and NIC devices.
@@ -605,56 +587,9 @@ func (p *Provisioner) stepCreateVM(ctx context.Context, logger *zap.Logger, pctx
 		return fmt.Errorf("failed to attach root disk: %w", err)
 	}
 
-	// Create and attach additional data disks
 	state.AdditionalZvolPaths = nil // Reset to avoid duplicates on retry
-
-	for i, disk := range data.AdditionalDisks {
-		diskPool := disk.Pool
-		if diskPool == "" {
-			diskPool = data.Pool
-		}
-
-		// Per-disk dataset_prefix overrides the MachineClass-level one
-		diskPrefix := disk.DatasetPrefix
-		if diskPrefix == "" {
-			diskPrefix = data.DatasetPrefix
-		}
-
-		diskBasePath := diskPool
-		if diskPrefix != "" {
-			diskBasePath = diskPool + "/" + diskPrefix
-		}
-
-		additionalZvolPath := fmt.Sprintf("%s/omni-vms/%s-disk-%d", diskBasePath, requestID, i+1)
-
-		// Ensure parent dataset hierarchy exists on the target pool
-		if diskPrefix != "" {
-			if err := p.client.EnsureDataset(ctx, diskBasePath); err != nil {
-				return fmt.Errorf("failed to ensure dataset prefix on pool %q for additional disk %d: %w", diskPool, i, err)
-			}
-		}
-
-		if err := p.client.EnsureDataset(ctx, diskBasePath+"/omni-vms"); err != nil {
-			return fmt.Errorf("failed to ensure omni-vms dataset on pool %q for additional disk %d: %w", diskPool, i, err)
-		}
-
-		if err := p.ensureZvol(ctx, logger, additionalZvolPath, disk.Size, disk.Encrypted, client.OmniManagedProperties(requestID)); err != nil {
-			return fmt.Errorf("additional disk %d: %w", i, err)
-		}
-
-		if _, err := p.client.AddDiskWithOrder(ctx, vm.ID, additionalZvolPath, 1001+i); err != nil {
-			return fmt.Errorf("failed to attach additional disk %d: %w", i, err)
-		}
-
-		state.AdditionalZvolPaths = append(state.AdditionalZvolPaths, additionalZvolPath)
-
-		logger.Info("attached additional disk",
-			zap.Int("index", i),
-			zap.String("pool", diskPool),
-			zap.Int("size_gib", disk.Size),
-			zap.Bool("encrypted", disk.Encrypted),
-			zap.String("path", additionalZvolPath),
-		)
+	if err := p.attachAdditionalDisks(ctx, logger, vm.ID, requestID, data, state); err != nil {
+		return err
 	}
 
 	if telemetry.AdditionalDisksTotal != nil && len(data.AdditionalDisks) > 0 {
@@ -708,241 +643,21 @@ func (p *Provisioner) stepCreateVM(ctx context.Context, logger *zap.Logger, pctx
 		}
 	}
 
-	// Attach primary NIC with a deterministic MAC derived from the request ID.
-	// This ensures the MAC survives reprovisioning, so DHCP reservations stay valid.
-	// Collision detection is scoped to the same network segment (bridge/VLAN) because
-	// MAC addresses only need to be unique within a single L2 broadcast domain.
-	primaryMAC := DeterministicMAC(requestID, 0)
-
-	segmentMACs, macErr := p.client.NICMACsOnSegment(ctx, data.NetworkInterface)
-	if macErr != nil {
-		logger.Warn("could not query segment MACs for collision detection — proceeding without",
-			zap.String("network_interface", data.NetworkInterface),
-			zap.Error(macErr),
-		)
-	} else {
-		resolved, collided := ResolveDeterministicMAC(requestID, 0, segmentMACs)
-		if collided {
-			logger.Warn("deterministic MAC collision on segment — resolved with alternate hash",
-				zap.String("original_mac", primaryMAC),
-				zap.String("resolved_mac", resolved),
-				zap.String("network_interface", data.NetworkInterface),
-				zap.String("vm_name", vmName),
-			)
-		}
-
-		primaryMAC = resolved
+	if err := p.attachPrimaryNIC(ctx, logger, vm.ID, vmName, requestID, data); err != nil {
+		return err
 	}
 
-	nicDev, err := p.client.AddNICWithConfig(ctx, vm.ID, client.NICConfig{
-		NetworkInterface: data.NetworkInterface,
-		MAC:              primaryMAC,
-	}, 2001)
+	mtuPatches, attachedMACs, err := p.attachAdditionalNICs(ctx, logger, vm.ID, vmName, requestID, data)
 	if err != nil {
-		return fmt.Errorf("failed to attach primary NIC: %w", err)
+		return err
 	}
 
-	// Log MAC address so users can create DHCP reservations in their router
-	if mac, ok := nicDev.Attributes["mac"].(string); ok && mac != "" {
-		logger.Info("VM NIC MAC address (deterministic) — stable across reprovision for DHCP reservations",
-			zap.String("mac", mac),
-			zap.String("vm_name", vmName),
-			zap.String("network_interface", data.NetworkInterface),
-			zap.String("role", "primary"),
-		)
+	if err := p.applyNICConfigPatches(ctx, logger, pctx, vmName, requestID, data, attachedMACs, mtuPatches); err != nil {
+		return err
 	}
 
-	// Attach additional NICs
-	var (
-		mtuPatches   []nicMTUConfig
-		attachedMACs = make([]string, len(data.AdditionalNICs))
-	)
-
-	for i, nic := range data.AdditionalNICs {
-		nicCfg := client.NICConfig{
-			NetworkInterface: nic.NetworkInterface,
-			Type:             nic.Type,
-			MTU:              nic.MTU,
-		}
-
-		// Always assign a deterministic MAC — matches primary NIC behavior so
-		// DHCP reservations survive reprovisioning on every interface.
-		nicMAC := DeterministicMAC(requestID, i+1)
-
-		nicSegmentMACs, segErr := p.client.NICMACsOnSegment(ctx, nic.NetworkInterface)
-		if segErr != nil {
-			logger.Warn("could not query segment MACs for collision detection — proceeding without",
-				zap.String("network_interface", nic.NetworkInterface),
-				zap.Error(segErr),
-			)
-		} else {
-			resolved, nicCollided := ResolveDeterministicMAC(requestID, i+1, nicSegmentMACs)
-			if nicCollided {
-				logger.Warn("deterministic MAC collision on segment — resolved with alternate hash",
-					zap.Int("index", i),
-					zap.String("original_mac", nicMAC),
-					zap.String("resolved_mac", resolved),
-					zap.String("network_interface", nic.NetworkInterface),
-					zap.String("vm_name", vmName),
-				)
-			}
-
-			nicMAC = resolved
-		}
-
-		nicCfg.MAC = nicMAC
-
-		dev, nicErr := p.client.AddNICWithConfig(ctx, vm.ID, nicCfg, 2002+i)
-		if nicErr != nil {
-			return fmt.Errorf("failed to attach additional NIC %d (%s): %w", i, nic.NetworkInterface, nicErr)
-		}
-
-		mac := ""
-		if m, ok := dev.Attributes["mac"].(string); ok {
-			mac = m
-		}
-
-		attachedMACs[i] = mac
-
-		if mac == "" {
-			// TrueNAS returned success but no MAC attribute on the attached
-			// device. Without a MAC, the Talos config patch's deviceSelector
-			// has nothing to match on, so this NIC is silently skipped from
-			// interface config — VM will boot single-homed on this link. Loud
-			// Warn so SRE can correlate when a multi-homed VM comes up with
-			// fewer IPs than expected.
-			logger.Warn("additional NIC attached but TrueNAS returned no MAC — skipping interface config patch for this NIC; VM will boot single-homed on this link",
-				zap.Int("index", i),
-				zap.String("network_interface", nic.NetworkInterface),
-				zap.String("vm_name", vmName),
-			)
-		}
-
-		if nic.MTU > 0 && mac != "" {
-			mtuPatches = append(mtuPatches, nicMTUConfig{mac: mac, mtu: nic.MTU})
-		}
-
-		dhcp := resolveNICDHCP(nic)
-
-		logger.Debug("attached additional NIC",
-			zap.Int("index", i),
-			zap.String("network_interface", nic.NetworkInterface),
-			zap.String("mac", mac),
-			zap.Int("mtu", nic.MTU),
-			zap.Bool("dhcp", dhcp),
-			zap.String("vm_name", vmName),
-		)
-	}
-
-	nicInterfaces, nicAggregate := collectNICInterfaceConfigs(data.AdditionalNICs, attachedMACs)
-
-	// Apply MTU config patches for NICs with custom MTU
-	if len(mtuPatches) > 0 {
-		patchData, patchErr := buildMTUPatch(mtuPatches)
-		if patchErr != nil {
-			return fmt.Errorf("failed to build MTU config patch: %w", patchErr)
-		}
-
-		if cpErr := applyConfigPatch(ctx, pctx, "nic-mtu", requestID, patchData); cpErr != nil {
-			return fmt.Errorf("failed to apply MTU config patch: %w", cpErr)
-		}
-
-		logger.Info("applied MTU config patch",
-			zap.Int("nic_count", len(mtuPatches)),
-			zap.String("vm_name", vmName),
-		)
-	}
-
-	// Apply interface config patch for every additional NIC. Talos only
-	// configures the primary link by default — without this patch,
-	// additional NICs come up with link-local IPv6 only and never acquire
-	// an IPv4 lease. Patch emits deviceSelector (by MAC) + dhcp per NIC.
-	// Static addresses / gateways are intentionally unsupported: the
-	// MachineClass is shared across every worker in a MachineSet, so any
-	// per-NIC IP typed into the class would be claimed by N workers and
-	// collide. DHCP + deterministic MACs + upstream DHCP reservations is
-	// the only way to pin specific per-worker IPs from a shared class.
-	if len(nicInterfaces) > 0 {
-		patchData, patchErr := buildAdditionalNICInterfacesPatch(nicInterfaces)
-		if patchErr != nil {
-			return fmt.Errorf("failed to build additional-NIC interfaces config patch: %w", patchErr)
-		}
-
-		if patchData != nil {
-			if cpErr := applyConfigPatch(ctx, pctx, "nic-interfaces", requestID, patchData); cpErr != nil {
-				return fmt.Errorf("failed to apply additional-NIC interfaces config patch: %w", cpErr)
-			}
-
-			logger.Info("applied additional-NIC interfaces config patch",
-				zap.Int("nic_count", len(nicInterfaces)),
-				zap.Int("dhcp_nics", nicAggregate.DHCPNICs),
-				zap.Int("noconfig_nics", nicAggregate.NoConfigNICs),
-				zap.String("vm_name", vmName),
-			)
-		}
-	}
-
-	// Apply advertised_subnets config patch if set. The patch content depends
-	// on machine role — `cluster.etcd.advertisedSubnets` is rejected by Talos
-	// validation on workers ("etcd config is only allowed on control plane
-	// machines"), so workers get only the kubelet portion.
-	isCP := isControlPlaneRequest(pctx)
-
-	buildRoleAwareSubnetsPatch := func(subnets string) ([]byte, error) {
-		if isCP {
-			return buildAdvertisedSubnetsPatch(subnets)
-		}
-
-		return buildKubeletSubnetsPatch(subnets)
-	}
-
-	if data.AdvertisedSubnets != "" {
-		patchData, patchErr := buildRoleAwareSubnetsPatch(data.AdvertisedSubnets)
-		if patchErr != nil {
-			return fmt.Errorf("failed to build advertised_subnets config patch: %w", patchErr)
-		}
-
-		if patchData != nil {
-			if cpErr := applyConfigPatch(ctx, pctx, "advertised-subnets", requestID, patchData); cpErr != nil {
-				return fmt.Errorf("failed to apply advertised_subnets config patch: %w", cpErr)
-			}
-
-			logger.Info("applied advertised_subnets config patch",
-				zap.String("subnets", data.AdvertisedSubnets),
-				zap.Bool("is_control_plane", isCP),
-				zap.String("vm_name", vmName),
-			)
-		}
-	} else if len(data.AdditionalNICs) > 0 {
-		// Auto-detect the primary NIC's subnet and pin kubelet (+ etcd on CPs) to it
-		subnet, subnetErr := p.client.InterfaceSubnet(ctx, data.NetworkInterface)
-
-		switch {
-		case subnetErr != nil:
-			logger.Warn("could not auto-detect primary NIC subnet — set advertised_subnets manually",
-				zap.String("network_interface", data.NetworkInterface),
-				zap.Error(subnetErr),
-			)
-		case subnet != "":
-			patchData, patchErr := buildRoleAwareSubnetsPatch(subnet)
-			if patchErr == nil && patchData != nil {
-				if cpErr := applyConfigPatch(ctx, pctx, "advertised-subnets", requestID, patchData); cpErr != nil {
-					return fmt.Errorf("failed to apply auto-detected advertised_subnets config patch: %w", cpErr)
-				}
-
-				logger.Info("auto-detected primary NIC subnet, applied advertised_subnets config patch",
-					zap.String("subnet", subnet),
-					zap.String("network_interface", data.NetworkInterface),
-					zap.Bool("is_control_plane", isCP),
-					zap.String("vm_name", vmName),
-				)
-			}
-		default:
-			logger.Warn("primary NIC has no IPv4 address — set advertised_subnets manually to pin etcd/kubelet",
-				zap.String("network_interface", data.NetworkInterface),
-				zap.String("vm_name", vmName),
-			)
-		}
+	if err := p.applyAdvertisedSubnetsConfigPatch(ctx, logger, pctx, vmName, requestID, data); err != nil {
+		return err
 	}
 
 	// Start the VM
@@ -966,6 +681,284 @@ func (p *Provisioner) stepCreateVM(ctx context.Context, logger *zap.Logger, pctx
 	)
 
 	return provision.NewRetryInterval(15 * time.Second)
+}
+
+// attachAdditionalDisks ensures parent datasets exist on the target pool for
+// each additional disk, creates the zvol (encrypted-aware), and attaches it
+// to the VM with stable boot ordering. Lifted out of stepCreateVM so the
+// outer step retains a flat list of work units rather than nesting one of
+// the largest loops in the package inside it.
+func (p *Provisioner) attachAdditionalDisks(ctx context.Context, logger *zap.Logger, vmID int, requestID string, data Data, state *specs.MachineSpec) error {
+	for i, disk := range data.AdditionalDisks {
+		diskPool := disk.Pool
+		if diskPool == "" {
+			diskPool = data.Pool
+		}
+		diskPrefix := disk.DatasetPrefix
+		if diskPrefix == "" {
+			diskPrefix = data.DatasetPrefix
+		}
+		diskBasePath := diskPool
+		if diskPrefix != "" {
+			diskBasePath = diskPool + "/" + diskPrefix
+		}
+
+		additionalZvolPath := fmt.Sprintf("%s/omni-vms/%s-disk-%d", diskBasePath, requestID, i+1)
+
+		if diskPrefix != "" {
+			if err := p.client.EnsureDataset(ctx, diskBasePath); err != nil {
+				return fmt.Errorf("failed to ensure dataset prefix on pool %q for additional disk %d: %w", diskPool, i, err)
+			}
+		}
+		if err := p.client.EnsureDataset(ctx, diskBasePath+"/omni-vms"); err != nil {
+			return fmt.Errorf("failed to ensure omni-vms dataset on pool %q for additional disk %d: %w", diskPool, i, err)
+		}
+		if err := p.ensureZvol(ctx, logger, additionalZvolPath, disk.Size, disk.Encrypted, client.OmniManagedProperties(requestID)); err != nil {
+			return fmt.Errorf("additional disk %d: %w", i, err)
+		}
+		if _, err := p.client.AddDiskWithOrder(ctx, vmID, additionalZvolPath, 1001+i); err != nil {
+			return fmt.Errorf("failed to attach additional disk %d: %w", i, err)
+		}
+
+		state.AdditionalZvolPaths = append(state.AdditionalZvolPaths, additionalZvolPath)
+
+		logger.Info("attached additional disk",
+			zap.Int("index", i),
+			zap.String("pool", diskPool),
+			zap.Int("size_gib", disk.Size),
+			zap.Bool("encrypted", disk.Encrypted),
+			zap.String("path", additionalZvolPath),
+		)
+	}
+	return nil
+}
+
+// attachPrimaryNIC computes the deterministic primary MAC (with on-segment
+// collision detection and fallback), attaches the NIC to the VM, and emits
+// the DHCP-reservation log line for operators.
+func (p *Provisioner) attachPrimaryNIC(ctx context.Context, logger *zap.Logger, vmID int, vmName, requestID string, data Data) error {
+	primaryMAC := DeterministicMAC(requestID, 0)
+
+	segmentMACs, macErr := p.client.NICMACsOnSegment(ctx, data.NetworkInterface)
+	if macErr != nil {
+		logger.Warn("could not query segment MACs for collision detection — proceeding without",
+			zap.String("network_interface", data.NetworkInterface),
+			zap.Error(macErr),
+		)
+	} else {
+		resolved, collided := ResolveDeterministicMAC(requestID, 0, segmentMACs)
+		if collided {
+			logger.Warn("deterministic MAC collision on segment — resolved with alternate hash",
+				zap.String("original_mac", primaryMAC),
+				zap.String("resolved_mac", resolved),
+				zap.String("network_interface", data.NetworkInterface),
+				zap.String("vm_name", vmName),
+			)
+		}
+		primaryMAC = resolved
+	}
+
+	nicDev, err := p.client.AddNICWithConfig(ctx, vmID, client.NICConfig{
+		NetworkInterface: data.NetworkInterface,
+		MAC:              primaryMAC,
+	}, 2001)
+	if err != nil {
+		return fmt.Errorf("failed to attach primary NIC: %w", err)
+	}
+
+	if mac, ok := nicDev.Attributes["mac"].(string); ok && mac != "" {
+		logger.Info("VM NIC MAC address (deterministic) — stable across reprovision for DHCP reservations",
+			zap.String("mac", mac),
+			zap.String("vm_name", vmName),
+			zap.String("network_interface", data.NetworkInterface),
+			zap.String("role", "primary"),
+		)
+	}
+	return nil
+}
+
+// attachAdditionalNICs handles the per-additional-NIC attach loop: MAC
+// generation + on-segment collision detection, AddNICWithConfig, MAC
+// aggregation for downstream config patches. Returns MTU patches and the
+// per-NIC attached MAC list for the caller to feed into config-patch
+// builders. The per-iteration logic is inline rather than in a sub-helper
+// because the MAC-absent decision (whether to emit an MTU patch, whether
+// the warn log fires) is the same coherent unit.
+func (p *Provisioner) attachAdditionalNICs(ctx context.Context, logger *zap.Logger, vmID int, vmName, requestID string, data Data) ([]nicMTUConfig, []string, error) {
+	var mtuPatches []nicMTUConfig
+	attachedMACs := make([]string, len(data.AdditionalNICs))
+
+	for i, nic := range data.AdditionalNICs {
+		nicCfg := client.NICConfig{
+			NetworkInterface: nic.NetworkInterface,
+			Type:             nic.Type,
+			MTU:              nic.MTU,
+		}
+
+		nicMAC := DeterministicMAC(requestID, i+1)
+
+		if nicSegmentMACs, segErr := p.client.NICMACsOnSegment(ctx, nic.NetworkInterface); segErr != nil {
+			logger.Warn("could not query segment MACs for collision detection — proceeding without",
+				zap.String("network_interface", nic.NetworkInterface),
+				zap.Error(segErr),
+			)
+		} else {
+			resolved, nicCollided := ResolveDeterministicMAC(requestID, i+1, nicSegmentMACs)
+			if nicCollided {
+				logger.Warn("deterministic MAC collision on segment — resolved with alternate hash",
+					zap.Int("index", i),
+					zap.String("original_mac", nicMAC),
+					zap.String("resolved_mac", resolved),
+					zap.String("network_interface", nic.NetworkInterface),
+					zap.String("vm_name", vmName),
+				)
+			}
+			nicMAC = resolved
+		}
+
+		nicCfg.MAC = nicMAC
+
+		dev, nicErr := p.client.AddNICWithConfig(ctx, vmID, nicCfg, 2002+i)
+		if nicErr != nil {
+			return nil, nil, fmt.Errorf("failed to attach additional NIC %d (%s): %w", i, nic.NetworkInterface, nicErr)
+		}
+
+		mac, _ := dev.Attributes["mac"].(string)
+		if mac == "" {
+			// Without a MAC, the Talos config patch's deviceSelector has nothing
+			// to match — this NIC is silently dropped from interface config and
+			// the VM boots single-homed on this link. Loud Warn so SRE can
+			// correlate when a multi-homed VM comes up with fewer IPs than expected.
+			logger.Warn("additional NIC attached but TrueNAS returned no MAC — skipping interface config patch for this NIC; VM will boot single-homed on this link",
+				zap.Int("index", i),
+				zap.String("network_interface", nic.NetworkInterface),
+				zap.String("vm_name", vmName),
+			)
+		}
+
+		attachedMACs[i] = mac
+		if nic.MTU > 0 && mac != "" {
+			mtuPatches = append(mtuPatches, nicMTUConfig{mac: mac, mtu: nic.MTU})
+		}
+
+		logger.Debug("attached additional NIC",
+			zap.Int("index", i),
+			zap.String("network_interface", nic.NetworkInterface),
+			zap.String("mac", mac),
+			zap.Int("mtu", nic.MTU),
+			zap.Bool("dhcp", resolveNICDHCP(nic)),
+			zap.String("vm_name", vmName),
+		)
+	}
+
+	return mtuPatches, attachedMACs, nil
+}
+
+// applyNICConfigPatches emits both MTU and per-NIC interface config patches
+// derived from the attached MACs.
+func (p *Provisioner) applyNICConfigPatches(ctx context.Context, logger *zap.Logger, pctx provision.Context[*resources.Machine], vmName, requestID string, data Data, attachedMACs []string, mtuPatches []nicMTUConfig) error {
+	if len(mtuPatches) > 0 {
+		patchData, patchErr := buildMTUPatch(mtuPatches)
+		if patchErr != nil {
+			return fmt.Errorf("failed to build MTU config patch: %w", patchErr)
+		}
+		if cpErr := applyConfigPatch(ctx, pctx, "nic-mtu", requestID, patchData); cpErr != nil {
+			return fmt.Errorf("failed to apply MTU config patch: %w", cpErr)
+		}
+		logger.Info("applied MTU config patch",
+			zap.Int("nic_count", len(mtuPatches)),
+			zap.String("vm_name", vmName),
+		)
+	}
+
+	nicInterfaces, nicAggregate := collectNICInterfaceConfigs(data.AdditionalNICs, attachedMACs)
+	if len(nicInterfaces) == 0 {
+		return nil
+	}
+
+	patchData, patchErr := buildAdditionalNICInterfacesPatch(nicInterfaces)
+	if patchErr != nil {
+		return fmt.Errorf("failed to build additional-NIC interfaces config patch: %w", patchErr)
+	}
+	if patchData == nil {
+		return nil
+	}
+	if cpErr := applyConfigPatch(ctx, pctx, "nic-interfaces", requestID, patchData); cpErr != nil {
+		return fmt.Errorf("failed to apply additional-NIC interfaces config patch: %w", cpErr)
+	}
+	logger.Info("applied additional-NIC interfaces config patch",
+		zap.Int("nic_count", len(nicInterfaces)),
+		zap.Int("dhcp_nics", nicAggregate.DHCPNICs),
+		zap.Int("noconfig_nics", nicAggregate.NoConfigNICs),
+		zap.String("vm_name", vmName),
+	)
+	return nil
+}
+
+// applyAdvertisedSubnetsConfigPatch emits the advertised_subnets patch. The
+// content depends on machine role (etcd config is rejected on workers).
+// When advertised_subnets is unset but additional NICs are present, the
+// primary NIC's subnet is auto-detected so kubelet (and etcd on CPs) pin
+// to the right address even on multi-NIC hosts.
+func (p *Provisioner) applyAdvertisedSubnetsConfigPatch(ctx context.Context, logger *zap.Logger, pctx provision.Context[*resources.Machine], vmName, requestID string, data Data) error {
+	isCP := isControlPlaneRequest(pctx)
+	buildRoleAware := func(subnets string) ([]byte, error) {
+		if isCP {
+			return buildAdvertisedSubnetsPatch(subnets)
+		}
+		return buildKubeletSubnetsPatch(subnets)
+	}
+
+	if data.AdvertisedSubnets != "" {
+		patchData, patchErr := buildRoleAware(data.AdvertisedSubnets)
+		if patchErr != nil {
+			return fmt.Errorf("failed to build advertised_subnets config patch: %w", patchErr)
+		}
+		if patchData == nil {
+			return nil
+		}
+		if cpErr := applyConfigPatch(ctx, pctx, "advertised-subnets", requestID, patchData); cpErr != nil {
+			return fmt.Errorf("failed to apply advertised_subnets config patch: %w", cpErr)
+		}
+		logger.Info("applied advertised_subnets config patch",
+			zap.String("subnets", data.AdvertisedSubnets),
+			zap.Bool("is_control_plane", isCP),
+			zap.String("vm_name", vmName),
+		)
+		return nil
+	}
+
+	if len(data.AdditionalNICs) == 0 {
+		return nil
+	}
+
+	subnet, subnetErr := p.client.InterfaceSubnet(ctx, data.NetworkInterface)
+	switch {
+	case subnetErr != nil:
+		logger.Warn("could not auto-detect primary NIC subnet — set advertised_subnets manually",
+			zap.String("network_interface", data.NetworkInterface),
+			zap.Error(subnetErr),
+		)
+	case subnet != "":
+		patchData, patchErr := buildRoleAware(subnet)
+		if patchErr == nil && patchData != nil {
+			if cpErr := applyConfigPatch(ctx, pctx, "advertised-subnets", requestID, patchData); cpErr != nil {
+				return fmt.Errorf("failed to apply auto-detected advertised_subnets config patch: %w", cpErr)
+			}
+			logger.Info("auto-detected primary NIC subnet, applied advertised_subnets config patch",
+				zap.String("subnet", subnet),
+				zap.String("network_interface", data.NetworkInterface),
+				zap.Bool("is_control_plane", isCP),
+				zap.String("vm_name", vmName),
+			)
+		}
+	default:
+		logger.Warn("primary NIC has no IPv4 address — set advertised_subnets manually to pin etcd/kubelet",
+			zap.String("network_interface", data.NetworkInterface),
+			zap.String("vm_name", vmName),
+		)
+	}
+	return nil
 }
 
 // translateStartError converts a vm.start failure into the most actionable
@@ -1457,60 +1450,64 @@ func (p *Provisioner) maybeResizeZvol(ctx context.Context, logger *zap.Logger, z
 	return nil
 }
 
-// ensureZvol creates a zvol (encrypted or plain), handling the "already exists" case
-// with passphrase retrieval, unlock, and resize. Used for both root and additional disks.
+// ensureZvol creates a zvol (encrypted or plain), handling the "already exists"
+// case with passphrase retrieval, unlock, and resize. Used for both root and
+// additional disks.
 func (p *Provisioner) ensureZvol(ctx context.Context, logger *zap.Logger, zvolPath string, sizeGiB int, encrypted bool, props []client.UserProperty) error {
 	if encrypted {
-		passphrase, genErr := generatePassphrase()
-		if genErr != nil {
-			return genErr
-		}
-
-		encProps := make([]client.UserProperty, len(props))
-		copy(encProps, props)
-		encProps = append(encProps, client.UserProperty{Key: passphraseProperty, Value: passphrase})
-
-		if _, err := p.client.CreateEncryptedZvol(ctx, zvolPath, sizeGiB, passphrase, encProps); err != nil {
-			if !isAlreadyExists(err) {
-				return fmt.Errorf("failed to create encrypted zvol %q: %w", zvolPath, err)
-			}
-
-			stored, propErr := p.client.GetDatasetUserProperty(ctx, zvolPath, passphraseProperty)
-			if propErr != nil {
-				return fmt.Errorf("failed to read stored passphrase from %q: %w", zvolPath, propErr)
-			}
-
-			if stored == "" {
-				return fmt.Errorf("encrypted zvol %q exists but has no stored passphrase — it may have been created manually or by an older provider version", zvolPath)
-			}
-
-			if locked, lockErr := p.client.IsDatasetLocked(ctx, zvolPath); lockErr == nil && locked {
-				logger.Debug("unlocking encrypted zvol", zap.String("path", zvolPath))
-
-				if unlockErr := p.client.UnlockDataset(ctx, zvolPath, stored); unlockErr != nil {
-					return fmt.Errorf("failed to unlock encrypted zvol %q: %w", zvolPath, unlockErr)
-				}
-			}
-
-			if resizeErr := p.maybeResizeZvol(ctx, logger, zvolPath, sizeGiB); resizeErr != nil {
-				return resizeErr
-			}
-		}
-
-		return nil
+		return p.ensureEncryptedZvol(ctx, logger, zvolPath, sizeGiB, props)
 	}
 
 	if _, err := p.client.CreateZvol(ctx, zvolPath, sizeGiB, props); err != nil {
 		if !isAlreadyExists(err) {
 			return fmt.Errorf("failed to create zvol %q: %w", zvolPath, err)
 		}
-
 		if resizeErr := p.maybeResizeZvol(ctx, logger, zvolPath, sizeGiB); resizeErr != nil {
 			return resizeErr
 		}
 	}
 
 	return nil
+}
+
+// ensureEncryptedZvol is the encrypted branch of ensureZvol: generate a
+// passphrase, attempt create, and on "already exists" recover the stored
+// passphrase, unlock-if-locked, and resize. Extracted so ensureZvol's cog
+// complexity stays under threshold.
+func (p *Provisioner) ensureEncryptedZvol(ctx context.Context, logger *zap.Logger, zvolPath string, sizeGiB int, props []client.UserProperty) error {
+	passphrase, genErr := generatePassphrase()
+	if genErr != nil {
+		return genErr
+	}
+
+	encProps := make([]client.UserProperty, len(props), len(props)+1)
+	copy(encProps, props)
+	encProps = append(encProps, client.UserProperty{Key: passphraseProperty, Value: passphrase})
+
+	_, err := p.client.CreateEncryptedZvol(ctx, zvolPath, sizeGiB, passphrase, encProps)
+	if err == nil {
+		return nil
+	}
+	if !isAlreadyExists(err) {
+		return fmt.Errorf("failed to create encrypted zvol %q: %w", zvolPath, err)
+	}
+
+	stored, propErr := p.client.GetDatasetUserProperty(ctx, zvolPath, passphraseProperty)
+	if propErr != nil {
+		return fmt.Errorf("failed to read stored passphrase from %q: %w", zvolPath, propErr)
+	}
+	if stored == "" {
+		return fmt.Errorf("encrypted zvol %q exists but has no stored passphrase — it may have been created manually or by an older provider version", zvolPath)
+	}
+
+	if locked, lockErr := p.client.IsDatasetLocked(ctx, zvolPath); lockErr == nil && locked {
+		logger.Debug("unlocking encrypted zvol", zap.String("path", zvolPath))
+		if unlockErr := p.client.UnlockDataset(ctx, zvolPath, stored); unlockErr != nil {
+			return fmt.Errorf("failed to unlock encrypted zvol %q: %w", zvolPath, unlockErr)
+		}
+	}
+
+	return p.maybeResizeZvol(ctx, logger, zvolPath, sizeGiB)
 }
 
 // swapCDROMForUpgrade updates the CDROM device to point to the new ISO.

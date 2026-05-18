@@ -330,7 +330,7 @@ func TestSetIfPoisonable_FirstAttemptSuccessNoRetry(t *testing.T) {
 	r := &recordingPoisonSetter{}
 	logger := zaptest.NewLogger(t)
 
-	persisted := setIfPoisonable(context.Background(), logger, r, "tank/iso", "key", "POISONED-x", "img-1", "/mnt/tank/iso/x.iso")
+	persisted := setIfPoisonable(context.Background(), logger, r, newISOCacheRef("tank/iso", "/mnt/tank/iso/x.iso", "img-1"), "key", "POISONED-x")
 
 	assert.True(t, persisted, "first-attempt success must report persisted=true")
 	assert.Equal(t, int32(1), r.calls.Load(), "no retry on first-attempt success")
@@ -351,7 +351,7 @@ func TestSetIfPoisonable_RetriesUntilSuccess(t *testing.T) {
 			r := &recordingPoisonSetter{failFor: failFor, failErr: errors.New("transient ws hangup")}
 			logger := zaptest.NewLogger(t)
 
-			persisted := setIfPoisonable(context.Background(), logger, r, "tank/iso", "key", "POISONED-x", "img-1", "/mnt/tank/iso/x.iso")
+			persisted := setIfPoisonable(context.Background(), logger, r, newISOCacheRef("tank/iso", "/mnt/tank/iso/x.iso", "img-1"), "key", "POISONED-x")
 
 			assert.True(t, persisted, "should ultimately persist on failFor=%d", failFor)
 			assert.Equal(t, int32(failFor+1), r.calls.Load(), "should call exactly failFor+1 times")
@@ -367,7 +367,7 @@ func TestSetIfPoisonable_AllAttemptsFailLogsManualCleanup(t *testing.T) {
 	core, observed := observer.New(zap.ErrorLevel)
 	logger := zap.New(core)
 
-	persisted := setIfPoisonable(context.Background(), logger, r, "tank/iso", "key", "POISONED-x", "img-1", "/mnt/tank/iso/x.iso")
+	persisted := setIfPoisonable(context.Background(), logger, r, newISOCacheRef("tank/iso", "/mnt/tank/iso/x.iso", "img-1"), "key", "POISONED-x")
 
 	assert.False(t, persisted, "exhausted retries must report persisted=false so caller can mention it in the outer error")
 	assert.Equal(t, int32(poisonRetryAttempts), r.calls.Load(), "exhausts retries")
@@ -392,7 +392,7 @@ func TestSetIfPoisonable_ContextCancellationStopsRetries(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // pre-cancelled
 
-	persisted := setIfPoisonable(ctx, logger, r, "tank/iso", "key", "POISONED-x", "img-1", "/mnt/tank/iso/x.iso")
+	persisted := setIfPoisonable(ctx, logger, r, newISOCacheRef("tank/iso", "/mnt/tank/iso/x.iso", "img-1"), "key", "POISONED-x")
 
 	// First attempt blocks on the delay-vs-ctx select and bails immediately
 	// with ctx.Err. No further retries should fire.
@@ -426,7 +426,7 @@ func TestSetIfPoisonable_ContextCanceledMidRetry(t *testing.T) {
 	}()
 
 	start := time.Now()
-	persisted := setIfPoisonable(ctx, logger, r, "tank/iso", "key", "POISONED-x", "img-1", "/mnt/tank/iso/x.iso")
+	persisted := setIfPoisonable(ctx, logger, r, newISOCacheRef("tank/iso", "/mnt/tank/iso/x.iso", "img-1"), "key", "POISONED-x")
 	elapsed := time.Since(start)
 
 	assert.False(t, persisted)
@@ -511,10 +511,7 @@ func TestVerifyCachedISO_Match(t *testing.T) {
 	p := newProvisionerWithTOFUMock(t, m)
 
 	stat := &client.FileInfo{Size: 100, Mtime: 1.0}
-	err := p.verifyCachedISO(context.Background(), zaptest.NewLogger(t),
-		"tank/talos-iso", "/mnt/tank/talos-iso/x.iso", "img1",
-		"org.omni:iso-sha256-img1", "org.omni:iso-size-img1", "org.omni:iso-mtime-img1",
-		stat)
+	err := p.verifyCachedISO(context.Background(), zaptest.NewLogger(t), newISOCacheRef("tank/talos-iso", "/mnt/tank/talos-iso/x.iso", "img1"), stat)
 
 	require.NoError(t, err, "match must succeed without writing anything")
 
@@ -537,10 +534,7 @@ func TestVerifyCachedISO_LegacyEntryRerecordsMetadata(t *testing.T) {
 	p := newProvisionerWithTOFUMock(t, m)
 
 	stat := &client.FileInfo{Size: 12345, Mtime: 1766353846.6033258}
-	err := p.verifyCachedISO(context.Background(), zaptest.NewLogger(t),
-		"tank/talos-iso", "/mnt/tank/talos-iso/x.iso", "img1",
-		"org.omni:iso-sha256-img1", "org.omni:iso-size-img1", "org.omni:iso-mtime-img1",
-		stat)
+	err := p.verifyCachedISO(context.Background(), zaptest.NewLogger(t), newISOCacheRef("tank/talos-iso", "/mnt/tank/talos-iso/x.iso", "img1"), stat)
 
 	require.NoError(t, err)
 
@@ -579,10 +573,7 @@ func TestVerifyCachedISO_PropertyReadFailureRefuses(t *testing.T) {
 	p := newProvisionerWithTOFUMock(t, m)
 
 	stat := &client.FileInfo{Size: 100, Mtime: 1.0}
-	err := p.verifyCachedISO(context.Background(), zaptest.NewLogger(t),
-		"tank/talos-iso", "/mnt/tank/talos-iso/x.iso", "img1",
-		"org.omni:iso-sha256-img1", "org.omni:iso-size-img1", "org.omni:iso-mtime-img1",
-		stat)
+	err := p.verifyCachedISO(context.Background(), zaptest.NewLogger(t), newISOCacheRef("tank/talos-iso", "/mnt/tank/talos-iso/x.iso", "img1"), stat)
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "refusing to reuse cached bytes")
@@ -602,10 +593,7 @@ func TestVerifyCachedISO_MetadataDriftPoisons(t *testing.T) {
 	p := newProvisionerWithTOFUMock(t, m)
 
 	stat := &client.FileInfo{Size: 999, Mtime: 1.0} // size drift
-	err := p.verifyCachedISO(context.Background(), zaptest.NewLogger(t),
-		"tank/talos-iso", "/mnt/tank/talos-iso/x.iso", "img1",
-		"org.omni:iso-sha256-img1", "org.omni:iso-size-img1", "org.omni:iso-mtime-img1",
-		stat)
+	err := p.verifyCachedISO(context.Background(), zaptest.NewLogger(t), newISOCacheRef("tank/talos-iso", "/mnt/tank/talos-iso/x.iso", "img1"), stat)
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "metadata re-verification")
@@ -640,10 +628,7 @@ func TestVerifyCachedISO_PoisonMarkedRefusesFast(t *testing.T) {
 	p := newProvisionerWithTOFUMock(t, m)
 
 	stat := &client.FileInfo{Size: 100, Mtime: 1.0}
-	err := p.verifyCachedISO(context.Background(), zaptest.NewLogger(t),
-		"tank/talos-iso", "/mnt/tank/talos-iso/x.iso", "img1",
-		"org.omni:iso-sha256-img1", "org.omni:iso-size-img1", "org.omni:iso-mtime-img1",
-		stat)
+	err := p.verifyCachedISO(context.Background(), zaptest.NewLogger(t), newISOCacheRef("tank/talos-iso", "/mnt/tank/talos-iso/x.iso", "img1"), stat)
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "POISONED")
@@ -712,10 +697,7 @@ func TestVerifyCachedISO_NoStoredHashIsFirstTimeProvision(t *testing.T) {
 	p := newProvisionerWithTOFUMock(t, m)
 
 	stat := &client.FileInfo{Size: 100, Mtime: 1.0}
-	err := p.verifyCachedISO(context.Background(), zaptest.NewLogger(t),
-		"tank/talos-iso", "/mnt/tank/talos-iso/x.iso", "img1",
-		"org.omni:iso-sha256-img1", "org.omni:iso-size-img1", "org.omni:iso-mtime-img1",
-		stat)
+	err := p.verifyCachedISO(context.Background(), zaptest.NewLogger(t), newISOCacheRef("tank/talos-iso", "/mnt/tank/talos-iso/x.iso", "img1"), stat)
 
 	require.NoError(t, err)
 }

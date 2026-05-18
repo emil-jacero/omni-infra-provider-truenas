@@ -81,9 +81,14 @@ resources:
   requests:
     cpu: 50m
     memory: 64Mi
+    # readOnlyRootFilesystem is set in the deployment, so writes only happen
+    # to log buffers and /tmp tmpfs. Reserve a modest budget so the kubelet
+    # can schedule + admit the pod without falling into BestEffort.
+    ephemeral-storage: 64Mi
   limits:
     cpu: 500m
     memory: 256Mi
+    ephemeral-storage: 256Mi
 
 nodeSelector: {}
 tolerations: []

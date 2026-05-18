@@ -139,38 +139,24 @@ func dialWebSocket(host string, insecureSkipVerify bool) (*websocket.Conn, error
 
 	conn, resp, err := dialer.Dial(wsURL, nil)
 	if err != nil {
-		// Only fall back to unencrypted ws:// if TLS verification is explicitly disabled.
-		// This prevents accidentally sending the API key over an unencrypted connection.
+		// TLS verification on → refuse cleartext fallback; operator never opted in.
 		if !insecureSkipVerify {
 			statusInfo := ""
 			if resp != nil {
 				statusInfo = fmt.Sprintf(" (HTTP %d)", resp.StatusCode)
 			}
-
 			return nil, fmt.Errorf("failed to connect to %s%s: %w — if TrueNAS uses a self-signed cert, set TRUENAS_INSECURE_SKIP_VERIFY=true", host, statusInfo, err)
 		}
 
-		// Cleartext fallback — loudly warn so an operator who set
-		// TRUENAS_INSECURE_SKIP_VERIFY=true for a dev cert issue does not
-		// silently downgrade a production deploy. The API key and control-plane
-		// traffic are now transiting cleartext. Suppressed for loopback because
-		// dev/CI setups hit ws://127.0.0.1 legitimately.
-		if !isLoopbackHost(host) {
-			slog.Warn("truenas websocket falling back to unencrypted ws:// — API key is sent in cleartext",
-				slog.String("host", host),
-				slog.String("remediation", "unset TRUENAS_INSECURE_SKIP_VERIFY or fix the TLS cert"),
-			)
-		}
-
+		// Operator opted in but TLS still failed. Re-dial cleartext after warning.
+		warnCleartextFallback(host)
 		wsURL = fmt.Sprintf("ws://%s/websocket", host)
-
 		conn, resp, err = dialer.Dial(wsURL, nil)
 		if err != nil {
 			statusInfo := ""
 			if resp != nil {
 				statusInfo = fmt.Sprintf(" (HTTP %d)", resp.StatusCode)
 			}
-
 			return nil, fmt.Errorf("failed to connect to %s%s: %w — is this TrueNAS SCALE 25.04+?", host, statusInfo, err)
 		}
 	}
@@ -184,6 +170,19 @@ func dialWebSocket(host string, insecureSkipVerify bool) (*websocket.Conn, error
 	conn.SetReadLimit(wsMaxMessageBytes)
 
 	return conn, nil
+}
+
+// warnCleartextFallback emits the security-critical warning before the
+// API key transits an unencrypted ws:// connection. Loopback is suppressed
+// because dev/CI setups legitimately hit ws://127.0.0.1.
+func warnCleartextFallback(host string) {
+	if isLoopbackHost(host) {
+		return
+	}
+	slog.Warn("truenas websocket falling back to unencrypted ws:// — API key is sent in cleartext",
+		slog.String("host", host),
+		slog.String("remediation", "unset TRUENAS_INSECURE_SKIP_VERIFY or fix the TLS cert"),
+	)
 }
 
 // newWSTransport creates a WebSocket transport and authenticates.
@@ -700,51 +699,7 @@ func (t *wsTransport) UploadFile(ctx context.Context, destPath string, data io.R
 	pr, pw := io.Pipe()
 	writer := multipart.NewWriter(pw)
 
-	go func() {
-		defer func() { _ = pw.Close() }()
-
-		dataPart, err := writer.CreateFormField("data")
-		if err != nil {
-			pw.CloseWithError(err)
-
-			return
-		}
-
-		// Build the filesystem.put envelope via json.Marshal rather than
-		// string formatting; %q produces Go-quoted strings which diverge from
-		// JSON string rules for some Unicode code points. destPath is
-		// provisioner-sourced today, but belt-and-braces — never hand-roll JSON.
-		dataJSON, merr := json.Marshal(map[string]any{
-			"method": "filesystem.put",
-			"params": []any{destPath, map[string]any{"mode": 493}},
-		})
-		if merr != nil {
-			pw.CloseWithError(merr)
-
-			return
-		}
-
-		if _, err = dataPart.Write(dataJSON); err != nil {
-			pw.CloseWithError(err)
-
-			return
-		}
-
-		filePart, err := writer.CreateFormFile("file", "upload")
-		if err != nil {
-			pw.CloseWithError(err)
-
-			return
-		}
-
-		if _, err = io.Copy(filePart, data); err != nil {
-			pw.CloseWithError(err)
-
-			return
-		}
-
-		_ = writer.Close()
-	}()
+	go writeUploadMultipart(pw, writer, destPath, data)
 
 	// Build the URL via net/url to make structural guarantees explicit —
 	// Host was checked by validateHost at construction so this is redundant,
@@ -783,4 +738,49 @@ func (t *wsTransport) UploadFile(ctx context.Context, destPath string, data io.R
 	span.SetStatus(codes.Ok, "")
 
 	return nil
+}
+
+// writeUploadMultipart streams the filesystem.put envelope + file body into
+// the upload pipe. Any error closes the pipe with that error so the HTTP
+// client surfaces it. Extracted from UploadFile to keep the caller's
+// complexity bounded.
+func writeUploadMultipart(pw *io.PipeWriter, writer *multipart.Writer, destPath string, data io.Reader) {
+	defer func() { _ = pw.Close() }()
+
+	dataPart, err := writer.CreateFormField("data")
+	if err != nil {
+		pw.CloseWithError(err)
+		return
+	}
+
+	// Build the filesystem.put envelope via json.Marshal rather than
+	// string formatting; %q produces Go-quoted strings which diverge from
+	// JSON string rules for some Unicode code points. destPath is
+	// provisioner-sourced today, but belt-and-braces — never hand-roll JSON.
+	dataJSON, err := json.Marshal(map[string]any{
+		"method": "filesystem.put",
+		"params": []any{destPath, map[string]any{"mode": 493}},
+	})
+	if err != nil {
+		pw.CloseWithError(err)
+		return
+	}
+
+	if _, err = dataPart.Write(dataJSON); err != nil {
+		pw.CloseWithError(err)
+		return
+	}
+
+	filePart, err := writer.CreateFormFile("file", "upload")
+	if err != nil {
+		pw.CloseWithError(err)
+		return
+	}
+
+	if _, err = io.Copy(filePart, data); err != nil {
+		pw.CloseWithError(err)
+		return
+	}
+
+	_ = writer.Close()
 }
