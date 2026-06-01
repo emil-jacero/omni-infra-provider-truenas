@@ -29,7 +29,9 @@ docs/content/
 │   ├── 02-sast-retro-shareable.md
 │   ├── 03-youtube-v5-storage.md
 │   ├── 04-storage-deep-dive-written.md  ← written companion to V5
-│   └── 05-cross-posts.md           ← Reddit + Lemmy drops, milestone-framed
+│   ├── 05-cross-posts.md           ← Reddit + Lemmy drops, milestone-framed
+│   ├── 06-control-plane-oom-war-story.md  ← shareable: 12 GB CP brownout + no-swap trap
+│   └── 07-control-plane-oom-social.md     ← LinkedIn long-form + X thread + Communities for piece 06
 ├── 04-month-4/                     ← Deepen authority + first podcast outreach
 │   ├── 01-upgrade-post.md
 │   ├── 02-singleton-lease-shareable.md

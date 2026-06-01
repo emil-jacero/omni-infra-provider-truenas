@@ -270,7 +270,7 @@ LinkedIn rule of thumb for personal-brand growth: 1 post/week, native long-form 
 >
 > If CPU or memory is consistently above 70% under normal load — bump it. Now, not later.
 >
-> For most homelab clusters with one of those operators installed, that means 4 vCPU / 4 GB minimum. For HA control planes running production-ish workloads, plan for 4–6 vCPU and 8 GB+ per replica.
+> For most homelab clusters with one of those operators installed, that means 4 vCPU / 4 GB minimum. **Crossplane is the exception.** On a single-CP cluster running Crossplane, the floor is 4 vCPU / 16 GB — anything less boots fine and browns out 3–5 days in. For HA control planes (3 replicas) running production-ish workloads, plan for 4–6 vCPU and 8 GB+ per replica.
 >
 > The math gets worse, not better, over time. Operators install more CRDs. CRDs eat etcd memory. apiserver eats apiserver memory. You're not wrong to start small. You're wrong to assume small lasts forever.
 

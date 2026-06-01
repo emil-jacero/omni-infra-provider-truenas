@@ -36,7 +36,7 @@ kubectl top node -l node-role.kubernetes.io/control-plane=
 
 CPU or memory consistently above 70% under normal load → bump it. Now, not later.
 
-For most homelab clusters with one of those operators installed, that means 4 vCPU / 4 GB minimum. For HA control planes running production-ish workloads, 4–6 vCPU and 8 GB+ per replica.
+For most homelab clusters with one of those operators installed, that means 4 vCPU / 4 GB minimum. **Crossplane is the exception** — on a single-CP cluster with Crossplane installed, the floor is 4 vCPU / 16 GB. Anything less boots fine and browns out 3–5 days in (etcd flap, scheduler CrashLoopBackOff, Deployments freeze). HA (3 CP) spreads the load: 4–6 vCPU and 8 GB+ per replica.
 
 Full post with the four observable triggers, sizing table by cluster scale, and the in-place resize procedure for single-CP setups: <link>
 
@@ -80,7 +80,7 @@ Quick PSA from sizing my homelab cluster (and a bunch of other people's via the 
 
 **Symptom**: cluster gets intermittently slow. List operations take 2 seconds instead of 200ms. Nothing errors. Nothing logs a problem. You debug for hours assuming something's broken — it's just the apiserver swapping under memory pressure.
 
-**The math**: a control plane running Argo + cert-manager + Prometheus is doing the work of a small enterprise cluster's CP. It needs 4 GB minimum. HA setups (3 replicas) want 6–8 GB each.
+**The math**: a control plane running Argo + cert-manager + Prometheus is doing the work of a small enterprise cluster's CP. It needs 4 GB minimum. Add Crossplane on a single-CP cluster and the floor jumps to 16 GB — Crossplane providers each add a controller + CRD set that the apiserver has to keep in cache, and on a single CP there's nowhere else for the load to go. HA setups (3 replicas) want 6–8 GB each.
 
 Easier to size up *before* you install those operators than after. Same MachineClass change either way, less debugging.
 

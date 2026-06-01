@@ -153,16 +153,23 @@ These are starting points, not hard rules. Calibrate against the triggers above.
 
 > **Crossplane changes the floor.** The `2 vCPU / 2 GiB` "Homelab" row is for
 > a *raw* Kubernetes cluster — no Crossplane, no service mesh, no heavy
-> operators. **If you run Crossplane at all, the floor is `4 vCPU / 4 GiB`
-> per CP node**, even at homelab scale. Each Crossplane provider installs
-> its own controller plus a CRD set the apiserver has to keep in cache, and
-> the work piles onto the same control-plane RAM that already holds etcd's
-> working set. The 2/2 default boots, but apiserver swaps under load, etcd
-> heartbeats slip, and the cluster looks "intermittently slow" with no
-> single failing component to point at — exactly the failure mode this
-> doc's triggers section is meant to head off. Other operators in the same
-> bucket: Rancher/Fleet, Argo CD with many ApplicationSets, Prometheus
-> Operator at full mesh-monitoring scale, Cilium with policy-heavy CRDs.
+> operators. **If you run Crossplane on a single-CP cluster, the floor is
+> `4 vCPU / 16 GiB` per CP node**, even at homelab scale. For HA (3 CP)
+> with Crossplane, `4 vCPU / 8 GiB` per replica is the floor — the load
+> spreads across replicas, but the working set still grows over days.
+> Each Crossplane provider installs its own controller plus a CRD set the
+> apiserver has to keep in cache, and the work piles onto the same
+> control-plane RAM that already holds etcd's working set. The numbers
+> below the 16 GiB single-CP floor boot fine and look healthy for days,
+> then brown out: apiserver and etcd working sets grow, `MemAvailable`
+> drops, Talos's userspace OOM controller starts reaping best-effort
+> cgroups (kube-proxy is usually the visible victim), reclaim stalls blow
+> etcd's fsync budget, and scheduler / controller-manager flap because
+> they can't sync caches or hold leases. There is no swap backstop on
+> Talos — once you're past the floor, RAM is the only lever. Other
+> operators in the same bucket: Rancher/Fleet, Argo CD with many
+> ApplicationSets, Prometheus Operator at full mesh-monitoring scale,
+> Cilium with policy-heavy CRDs.
 
 ### Why the root disk has a 20 GiB minimum
 

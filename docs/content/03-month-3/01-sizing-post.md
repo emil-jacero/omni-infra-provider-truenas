@@ -89,12 +89,15 @@ These are the numbers I actually use. Adjust if your workload is unusual.
 |---|---|---|---|---|
 | Homelab (≤ 5 nodes) | Static apps, no operators | 2 | 2 GB | 20 GB |
 | Homelab (≤ 5 nodes) | Argo CD + cert-manager + Prometheus | **4** | **4 GB** | 40 GB |
-| Homelab (≤ 5 nodes) | Add Crossplane or Rancher/Fleet | **4** | **6 GB** | 40 GB |
+| Homelab (≤ 5 nodes), **single CP** | Add Crossplane or Rancher/Fleet | **4** | **16 GB** | 40 GB |
+| Homelab (≤ 5 nodes), **HA (3 CP)** | Add Crossplane or Rancher/Fleet | **4** | **8 GB** per replica | 40 GB |
 | Small team (5–10 nodes) | Argo CD + observability mesh | 4 | 8 GB | 60 GB |
 | Small team (10–20 nodes) | Operators + heavy CRD load | 6 | 12 GB | 80 GB |
 | Production-ish (20+ nodes) | HA control plane (3× replicas) | 8 | 16 GB | 100 GB |
 
 **Most homelab undersizing happens at the second row.** People stick with 2 GB after installing Argo and Prometheus, then debug "the cluster is randomly slow" for weeks. The fix is 4 GB.
+
+**The next-most-common undersizing is the Crossplane row on a single-CP cluster.** People treat Crossplane as just another operator and bump RAM the same way they did for Argo + Prometheus — to 4–8 GB. That works for the first few days, then browns out: scheduler stuck at "waiting for caches to sync," controller-manager flapping, etcd health probe oscillating OK / `context deadline exceeded`. The etcd DB itself is tiny and healthy, so defrag does nothing. The actual cause is RAM pressure underneath etcd. On Talos there is no swap backstop. **For a single-CP cluster with Crossplane installed, treat 16 GB as the floor, not 4–8.** HA (3 CP) spreads the load and 8 GB per replica is sufficient.
 
 ---
 
