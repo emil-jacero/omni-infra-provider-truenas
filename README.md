@@ -643,4 +643,3 @@ We use an **issues-only** contribution model — no pull requests. Open an issue
 MIT — see [LICENSE](LICENSE).
 
 Built by [Bear Binary](https://github.com/bearbinary).
-
