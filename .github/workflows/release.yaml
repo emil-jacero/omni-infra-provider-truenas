@@ -73,10 +73,14 @@ jobs:
       # --version exits 0 immediately without needing Omni or TrueNAS config —
       # catches the "binary missing execute bit / crashed on startup" class of
       # regression without needing to smoke-test against real credentials.
+      # build-push-action with push:true (no load:true) only sends the image
+      # to the registry, not the runner's local Docker daemon — pull it back
+      # down before `docker run` can see it.
       - name: Smoke test pushed image
         run: |
           set -euo pipefail
           IMAGE="ghcr.io/${{ github.repository }}:${TAG}"
+          docker pull --quiet "${IMAGE}"
           OUTPUT=$(docker run --rm "${IMAGE}" --version 2>&1)
           echo "stdout: ${OUTPUT}"
           if [ "${OUTPUT}" != "${TAG}" ]; then
